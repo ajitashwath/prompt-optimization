@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Annotate Pairwise Comparison</h1>
+    <p class="subtitle">Review the user request and compare Response A vs Response B. Score or select the preferred output using the guidelines.</p>
+</div>
+
+<div class="workspace-grid">
+    <!-- Left Column: Context -->
+    <div class="context-panel">
+        <h2 class="panel-title">Conversation Context</h2>
+        <div class="conversation-view">
+            <div class="message message-user">
+                <span class="message-role">USER</span>
+                <p>Conversation ID: <code>{{ item.conversation_id }}</code></p>
+            </div>
+            <!-- Stub or full dialog if available -->
+            <div class="message message-system">
+                <span class="message-role">SYS</span>
+                <p>Rubric: {{ item.rubric_version }}</p>
+            </div>
+        </div>
+
+        <div class="rubric-panel">
+            <h3>Evaluation Criteria</h3>
+            {% for dim in rubric.dimensions %}
+                <div class="rubric-item">
+                    <strong>{{ dim.name|capitalize }}</strong> (Scale: 1-{{ dim.scale }})
+                    <p>{{ dim.description }}</p>
+                </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Right Column: Comparison -->
+    <div class="comparison-panel">
+        <form action="/annotate/{{ item.id }}" method="post" class="annotation-form">
+            <div class="responses-grid">
+                <div class="response-card" id="card-a">
+                    <h3>Response A</h3>
+                    <div class="response-body">{{ item.response_a }}</div>
+                </div>
+                <div class="response-card" id="card-b">
+                    <h3>Response B</h3>
+                    <div class="response-body">{{ item.response_b }}</div>
+                </div>
+            </div>
+
+            <div class="decision-panel">
+                <h3 class="section-title">Your Verdict</h3>
+                
+                <div class="verdict-options">
+                    <label class="verdict-label">
+                        <input type="radio" name="preferred" value="A" required>
+                        <span class="verdict-button">Response A is Better</span>
+                    </label>
+                    <label class="verdict-label">
+                        <input type="radio" name="preferred" value="B">
+                        <span class="verdict-button">Response B is Better</span>
+                    </label>
+                    <label class="verdict-label">
+                        <input type="radio" name="preferred" value="tie">
+                        <span class="verdict-button">Tie / Equal Quality</span>
+                    </label>
+                </div>
+
+                <div class="rationale-input">
+                    <label for="rationale">Provide detailed rationale (minimum 1 sentence):</label>
+                    <textarea name="rationale" id="rationale" rows="4" placeholder="Explain why you preferred this response. Highlight specific sentences, tone mismatches, or format issues." required></textarea>
+                </div>
+
+                <div class="form-actions">
+                    <a href="/queue" class="btn btn-secondary">Back to Queue</a>
+                    <button type="submit" class="btn btn-primary">Submit Annotation</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

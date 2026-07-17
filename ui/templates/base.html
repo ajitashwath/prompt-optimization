@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title or "Labeling Studio" }} | Antigravity</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="navbar">
+        <div class="navbar-container">
+            <div class="logo">
+                <span class="logo-accent">Antigravity</span> Prompt Opt
+            </div>
+            <nav class="nav-links">
+                <a href="/" class="{% if active_tab == 'home' %}active{% endif %}">Dashboard</a>
+                <a href="/queue" class="{% if active_tab == 'queue' %}active{% endif %}">Queue</a>
+                <a href="/calibration" class="{% if active_tab == 'calibration' %}active{% endif %}">Calibration</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        {% block content %}
+        <div class="hero-section">
+            <h1 class="hero-title">Self-Improving Prompt Optimization</h1>
+            <p class="hero-subtitle">Evolve, evaluate, and deploy high-performance LLM system prompts using a closed-loop human-in-the-loop pipeline.</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{{ stats.total }}</div>
+                <div class="stat-label">Total Conversations</div>
+            </div>
+            <div class="stat-card accent-card">
+                <div class="stat-value">{{ stats.unlabeled }}</div>
+                <div class="stat-label">Pending Annotation</div>
+            </div>
+            <div class="stat-card success-card">
+                <div class="stat-value">{{ stats.labeled }}</div>
+                <div class="stat-label">Gold Annotated</div>
+            </div>
+        </div>
+
+        <div class="dashboard-details">
+            <h2>Pipeline Status</h2>
+            <div class="status-list">
+                <div class="status-item">
+                    <span class="status-indicator active"></span>
+                    <div class="status-info">
+                        <h3>Ingestion Engine</h3>
+                        <p>PII Redaction & Dedup online. Stratification active.</p>
+                    </div>
+                </div>
+                <div class="status-item">
+                    <span class="status-indicator active"></span>
+                    <div class="status-info">
+                        <h3>LLM-as-Judge Calibration</h3>
+                        <p>Agreement score monitoring active. Current calibrator online.</p>
+                    </div>
+                </div>
+                <div class="status-item">
+                    <span class="status-indicator idle"></span>
+                    <div class="status-info">
+                        <h3>Optimizer Engines (MIPROv2 & GEPA)</h3>
+                        <p>Idle. Awaiting trigger run.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endblock %}
+    </main>
+
+    <footer class="footer">
+        <p>&copy; 2026 Antigravity Optimization Pipeline. Built for production LLM systems.</p>
+    </footer>
+</body>
+</html>

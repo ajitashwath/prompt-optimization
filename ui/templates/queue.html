@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Human Annotation Queue</h1>
+    <p class="subtitle">Select a pairwise candidate pair to annotate preferred model responses and record rationales for judge calibration.</p>
+</div>
+
+<div class="queue-container">
+    {% if items %}
+        <div class="table-wrapper">
+            <table class="queue-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Conversation ID</th>
+                        <th>Rubric Version</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in items %}
+                        <tr>
+                            <td><code>{{ item.id[:8] }}</code></td>
+                            <td><code>{{ item.conversation_id }}</code></td>
+                            <td><span class="badge badge-version">{{ item.rubric_version }}</span></td>
+                            <td>
+                                {% if item.preferred %}
+                                    <span class="badge badge-success">Completed</span>
+                                {% else: %}
+                                    <span class="badge badge-warning">Pending</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <a href="/annotate/{{ item.id }}" class="btn btn-primary">Annotate</a>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <div class="empty-icon">✓</div>
+            <h3>Queue is Empty</h3>
+            <p>No conversations are pending human annotation. High-five your data engineering team!</p>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}

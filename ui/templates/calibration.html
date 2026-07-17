@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Judge Calibration Report</h1>
+    <p class="subtitle">Detailed diagnostic agreement and bias analysis comparing the LLM-as-Judge against the gold human annotator dataset.</p>
+</div>
+
+{% if report.n_items > 0 %}
+<div class="calibration-grid">
+    <!-- Summary Metrics -->
+    <div class="card stat-card-wide">
+        <h2 class="card-title">Agreement Summary</h2>
+        <div class="metrics-row">
+            <div class="metric-item">
+                <span class="metric-label">Gold Items Evaluated</span>
+                <span class="metric-value">{{ report.n_items }}</span>
+            </div>
+            <div class="metric-item">
+                <span class="metric-label">Cohen's Kappa (Agreement)</span>
+                <span class="metric-value {% if report.kappa >= 0.6 %}text-success{% else %}text-warning{% endif %}">
+                    {{ "%.3f"|format(report.kappa) }}
+                </span>
+                <span class="metric-badge">{{ report.kappa_interpretation }}</span>
+            </div>
+            <div class="metric-item">
+                <span class="metric-label">Spearman Rank Correlation</span>
+                <span class="metric-value {% if report.spearman_rho >= 0.7 %}text-success{% else %}text-warning{% endif %}">
+                    {{ "%.3f"|format(report.spearman_rho) }}
+                </span>
+            </div>
+        </div>
+        <div class="calibration-status">
+            {% if report.passed %}
+                <div class="badge badge-success-large">Calibration Passed</div>
+                <p class="status-desc">The LLM Judge alignment metrics meet the minimum requirements. This version is safe to freeze and use as an optimizer reward signal.</p>
+            {% else %}
+                <div class="badge badge-error-large">Calibration Failed</div>
+                <ul class="reasons-list">
+                    {% for reason in report.failure_reasons %}
+                        <li>{{ reason }}</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Bias Diagnostics -->
+    {% if report.bias %}
+    <div class="card">
+        <h2 class="card-title">Bias Diagnostics</h2>
+        <div class="bias-list">
+            <div class="bias-item">
+                <div class="bias-header">
+                    <h3>Length Bias</h3>
+                    <span class="status-indicator {% if report.bias.has_significant_length_bias %}active{% else %}inactive{% endif %}"></span>
+                </div>
+                <p>Measures if the judge prefers longer responses regardless of quality. Spearman Correlation: <code>{{ "%.3f"|format(report.bias.length_bias_rho) }}</code> (p-val: <code>{{ "%.4f"|format(report.bias.length_bias_pvalue) }}</code>)</p>
+            </div>
+            <div class="bias-item">
+                <div class="bias-header">
+                    <h3>Position Bias</h3>
+                    <span class="status-indicator {% if report.bias.has_significant_position_bias %}active{% else %}inactive{% endif %}"></span>
+                </div>
+                <p>Measures if the judge prefers Response A over Response B due to presentation order. First-Response preference rate: <code>{{ "%.1f%%"|format(report.bias.position_bias_rate * 100) }}</code></p>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Confusion Matrix -->
+    <div class="card">
+        <h2 class="card-title">Agreement Confusion Matrix</h2>
+        <p class="subtitle">Rows: Human Label, Columns: Judge Label</p>
+        <div class="matrix-wrapper">
+            <table class="confusion-table">
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>Judge A</th>
+                        <th>Judge B</th>
+                        <th>Judge Tie</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <th>Human A</th>
+                        <td>{{ report.confusion_matrix[0][0] }}</td>
+                        <td>{{ report.confusion_matrix[0][1] }}</td>
+                        <td>{{ report.confusion_matrix[0][2] }}</td>
+                    </tr>
+                    <tr>
+                        <th>Human B</th>
+                        <td>{{ report.confusion_matrix[1][0] }}</td>
+                        <td>{{ report.confusion_matrix[1][1] }}</td>
+                        <td>{{ report.confusion_matrix[1][2] }}</td>
+                    </tr>
+                    <tr>
+                        <th>Human Tie</th>
+                        <td>{{ report.confusion_matrix[2][0] }}</td>
+                        <td>{{ report.confusion_matrix[2][1] }}</td>
+                        <td>{{ report.confusion_matrix[2][2] }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% else %}
+<div class="empty-state">
+    <div class="empty-icon">⚠</div>
+    <h3>No Calibration Data</h3>
+    <p>Cannot run calibration diagnostics. Please annotate at least 5 gold items first to generate metrics.</p>
+    <a href="/queue" class="btn btn-primary">Start Annotating</a>
+</div>
+{% endif %}
+{% endblock %}
