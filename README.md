@@ -1,17 +1,9 @@
 # Self-Improving Prompt Optimization Pipeline
-
 A closed-loop system that automatically evolves an LLM's system prompt (and few-shot
 examples) using production conversation logs, calibrated LLM-judges, and Bayesian /
 Genetic optimizers.
 
-The system never deploys on faith: every candidate must pass a statistical
-champion/challenger gate, a 100% safety regression suite, an optional human spot-check,
-a staged canary rollout, and is auto-rolled back if live metrics degrade.
-
----
-
 ## Table of Contents
-
 1. [Architecture](#architecture)
 2. [How the Loop Works](#how-the-loop-works)
 3. [Requirements](#requirements)
@@ -27,10 +19,7 @@ a staged canary rollout, and is auto-rolled back if live metrics degrade.
 13. [Project Structure](#project-structure)
 14. [Troubleshooting](#troubleshooting)
 
----
-
 ## Architecture
-
 ```
  ┌────────────────┐     ┌───────────────────┐     ┌────────────────────┐
  │ Conversation    │     │  Human Labeling    │     │  Judge Calibration  │
@@ -84,8 +73,6 @@ a staged canary rollout, and is auto-rolled back if live metrics degrade.
 | 4. Champion Gate | `prompt_opt/gate` | The only component allowed to touch the frozen test split. Runs paired bootstrap CIs (10,000 resamples) + Wilcoxon signed-rank tests on paired win/loss/tie outcomes, enforces win-rate thresholds, guardrail non-regression, and a 100% regression-suite pass rate. Produces immutable `PASS / FAIL / PENDING_HUMAN` verdicts. |
 | 5. Registry & Deployment | `prompt_opt/registry`, `prompt_opt/deployment` | Content-addressed, append-only prompt version store with an audit log of champion transitions. Rollback reverts to the previous promoted version. Shadow mode serves the champion while logging challenger responses; canary mode ramps traffic 1% -> 5% -> 25% -> 100% with soak periods and breach halts. |
 | 6. Feedback Loop | `prompt_opt/feedback` | Cron-driven scheduler that re-ingests fresh logs and triggers re-optimization, plus KL-divergence drift detection over production score distributions. |
-
----
 
 ## Requirements
 
@@ -166,7 +153,6 @@ Every value has a sensible default; only an API key is mandatory for LLM stages.
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/prompt_opt.db` | Main storage DB |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
----
 
 ## Quick Start (Full Walkthrough)
 
@@ -175,12 +161,12 @@ This takes you from raw logs to a deployed, gated prompt. Commands below use
 `prompt-opt` entry point instead.
 
 ```bash
-# ── Step 1: Ingest raw production logs ─────────────────────────────────────
+# Step 1: Ingest raw production logs
 # PII-scrubs, deduplicates, classifies, and stratifies into persisted splits.
 python -m prompt_opt.cli.main ingest --input-file data/sample_conversations.jsonl
 # Output: train/dev/test counts + files written to ./data/splits/*.jsonl
 
-# ── Step 2: Build a gold label set in the Studio ───────────────────────────
+# Step 2: Build a gold label set in the Studio
 python -m prompt_opt.cli.main add-gold \
     --conversation-id conv_001 \
     --response-a "Answer A text..." \
@@ -189,19 +175,19 @@ python -m prompt_opt.cli.main studio --port 8000
 # Open http://127.0.0.1:8000 -> Queue tab -> annotate pairs (choose A / B / tie).
 # Aim for >= 20 labeled items before calibrating.
 
-# ── Step 3: Calibrate the LLM judge against human labels ───────────────────
+# Step 3: Calibrate the LLM judge against human labels
 python -m prompt_opt.cli.main calibrate-judge
 # PASS  -> judge frozen into data/judge_registry.json
 # FAIL  -> failure reasons printed (kappa too low, position bias, etc.)
 
-# ── Step 4: Run an optimizer over the persisted splits ─────────────────────
+# Step 4: Run an optimizer over the persisted splits
 python -m prompt_opt.cli.main optimize --algorithm miprov2 --n-trials 20 --max-usd 10.0
 # or the genetic optimizer:
 python -m prompt_opt.cli.main optimize --algorithm gepa --n-trials 10
 # Registers the best candidate and prints its content hash, e.g.:
 #   Best Candidate Hash: 3d1fdd7c836a3303
 
-# ── Step 5: Run the champion/challenger gate ───────────────────────────────
+# Step 5: Run the champion/challenger gate
 python -m prompt_opt.cli.main gate \
     --challenger-hash 3d1fdd7c836a3303 \
     --skip-human-review          # omit this flag to require human sign-off
@@ -215,12 +201,12 @@ python -m prompt_opt.cli.main gate --challenger-hash 3d1fdd7c836a3303
 python -m prompt_opt.cli.main gate-approve --reviewer alice            # approve
 python -m prompt_opt.cli.main gate-approve --reviewer bob --reject     # or reject
 
-# ── Step 6: Shadow-mode the new prompt before exposing traffic ─────────────
+# Step 6: Shadow-mode the new prompt before exposing traffic
 python -m prompt_opt.cli.main shadow --challenger-hash 3d1fdd7c836a3303 --n 20
 # Serves the champion; logs challenger responses side-by-side to
 # ./data/shadow_logs/shadow_log.jsonl for offline scoring.
 
-# ── Step 7: Staged canary rollout ───────────────────────────────────────────
+# Step 7: Staged canary rollout
 python -m prompt_opt.cli.main canary start \
     --challenger-hash 3d1fdd7c836a3303 --champion-hash <current-champion-hash>
 python -m prompt_opt.cli.main canary status       # stage, traffic %, soak timer
@@ -228,7 +214,7 @@ python -m prompt_opt.cli.main canary advance      # move to next ramp stage when
 python -m prompt_opt.cli.main canary breach       # record a live guardrail breach
 python -m prompt_opt.cli.main canary rollback --reason "error spike"
 
-# ── Step 8: Live rollback monitoring ────────────────────────────────────────
+# Step 8: Live rollback monitoring
 # Wire these flags to your real metrics; any breach auto-reverts the registry
 # champion to the previously promoted version.
 python -m prompt_opt.cli.main monitor \
@@ -236,18 +222,17 @@ python -m prompt_opt.cli.main monitor \
     --latency-current 250 --latency-baseline 200 \
     --refusal-rate 0.08 --refusal-baseline 0.05
 
-# ── Step 9: Drift detection on production scores ────────────────────────────
+# Step 9: Drift detection on production scores
 python -m prompt_opt.cli.main drift-check \
     --baseline-file baseline_scores.json \
     --scores-file recent_scores.json
 
-# ── Step 10: Continuous loop ─────────────────────────────────────────────────
+# Step 10: Continuous loop
 python -m prompt_opt.cli.main loop           # scheduled by REINGEST_CRON / REOPTIMIZE_CRON
 python -m prompt_opt.cli.main loop --once    # single cycle, then exit
 ```
 
 Typical end-state after one loop iteration:
-
 ```
 data/
 ├── splits/{train,dev,test}.jsonl     # curated dataset
@@ -258,14 +243,10 @@ data/
 └── canary_state.json                 # rollout state machine
 ```
 
----
-
 ## CLI Reference
-
 Every command supports `--help` for the full option list.
 
 ### `ingest`
-
 ```bash
 python -m prompt_opt.cli.main ingest --input-file PATH [options]
 ```
@@ -282,28 +263,24 @@ Pipeline: parse -> regex PII scrub (+ NER) -> heuristic category/difficulty enri
 FAISS embedding dedup -> stratified split -> persist to `data/splits/`.
 
 ### `add-gold`
-
 ```bash
 python -m prompt_opt.cli.main add-gold --conversation-id ID --response-a TEXT --response-b TEXT
 ```
 Adds an unlabeled pair to the annotation queue.
 
 ### `studio`
-
 ```bash
 python -m prompt_opt.cli.main studio [--port 8000] [--host 127.0.0.1]
 ```
 FastAPI labeling UI. Routes: `/` (stats), `/queue`, `/annotate/{id}`, `/calibration`.
 
 ### `calibrate-judge`
-
 Runs the LLM judge over every labeled gold item and reports Cohen's kappa,
 Spearman/Pearson correlation, agreement rate, confusion matrix, and length/position
 bias diagnostics. On success the judge is frozen as a new version in
 `data/judge_registry.json`.
 
 ### `optimize`
-
 ```bash
 python -m prompt_opt.cli.main optimize [options]
 ```
@@ -320,7 +297,6 @@ search from the current registry champion, registers the winner with its eval sc
 and prints the content hash needed by `gate`.
 
 ### `gate`
-
 ```bash
 python -m prompt_opt.cli.main gate --challenger-hash HASH [--champion-hash HASH] [options]
 ```
@@ -339,7 +315,6 @@ regression suite replayed live through the challenger prompt (from
 `data/regression_suite.jsonl`). Exit codes: `0` = PASS/PENDING, `1` = FAIL.
 
 ### `gate-approve`
-
 ```bash
 python -m prompt_opt.cli.main gate-approve --reviewer NAME [--result-file PATH]
                                             [--notes TEXT] [--reject]
@@ -348,7 +323,6 @@ Records the human decision on the most recent pending gate result (or a specific
 and promotes the challenger on approval.
 
 ### `shadow`
-
 ```bash
 python -m prompt_opt.cli.main shadow --challenger-hash HASH [--n 5] [--split dev]
 ```
@@ -356,7 +330,6 @@ Replays N conversations through both prompts. Champion response is what would be
 served; both are logged to `data/shadow_logs/shadow_log.jsonl`.
 
 ### `canary`
-
 ```bash
 python -m prompt_opt.cli.main canary ACTION [options]
 ```
@@ -373,7 +346,6 @@ State persists in `data/canary_state.json` and survives process restarts
 (`CanaryController.load()`).
 
 ### `monitor`
-
 ```bash
 python -m prompt_opt.cli.main monitor [--error-rate F] [--latency-current MS]
     [--latency-baseline MS] [--refusal-rate F] [--refusal-baseline F]
@@ -384,7 +356,6 @@ Default trigger thresholds: error rate > 5%, latency regression > 30%, refusal d
 registry champion back and exits `1`.
 
 ### `drift-check`
-
 ```bash
 python -m prompt_opt.cli.main drift-check --baseline-file F --scores-file F
                                           [--refusal-rate F] [--format-compliance F]
@@ -393,7 +364,6 @@ Both files contain a JSON array of floats. Flags critical/warning KL-divergence 
 exits `1` when events fire.
 
 ### `loop`
-
 ```bash
 python -m prompt_opt.cli.main loop [--once]
 ```
@@ -401,14 +371,10 @@ Starts the APScheduler background loop using `REINGEST_CRON` and `REOPTIMIZE_CRO
 Each cycle ingests `data/raw_production_logs.jsonl` (drop new exports there),
 refreshes splits, and re-runs optimization from the current champion when data allows.
 
----
 
 ## Data Formats
-
 ### Raw conversation logs (`--input-file`, `raw_production_logs.jsonl`)
-
 One JSON object per line:
-
 ```json
 {
   "conversation_id": "conv_001",
@@ -428,7 +394,6 @@ Only `conversation_id` and `messages` are required. Malformed lines are skipped 
 warning.
 
 ### Regression suite (`data/regression_suite.jsonl`)
-
 One case per line:
 
 ```json
@@ -446,12 +411,10 @@ Supported `expected_behavior` values: `refuse`, `redirect_to_crisis`, `deny_pii`
 during gating.
 
 ### Persisted splits
-
 `data/splits/{train,dev,test}.jsonl` — one serialized `ConversationRecord` per line,
 round-trippable via `DatasetStore.load_split("train")`.
 
 ## Storage Layout
-
 | Path | Contents |
 |------|----------|
 | `data/prompt_opt.db` | SQLite: `prompt_versions` (immutable registry), `champion_events` (promote/rollback audit), eval cache tables, gold labels |
@@ -463,7 +426,6 @@ round-trippable via `DatasetStore.load_split("train")`.
 | `data/raw_production_logs.jsonl` | Drop point for fresh logs consumed by `loop` |
 
 ## Python API Usage
-
 ```python
 from pathlib import Path
 
@@ -515,7 +477,6 @@ ctrl = CanaryController.load("./data/canary_state.json")           # resume roll
 ```
 
 ## Running Without API Keys
-
 Everything except `optimize`, `gate`, `shadow`, and `calibrate-judge` (with labeled
 data present) works fully offline: `ingest`, `add-gold`, `studio`, `canary`, `monitor`,
 `drift-check`, `loop`. LLM-bound commands fail fast with a clear message telling you
@@ -525,7 +486,6 @@ For CI-style verification of the LLM stages without keys, see
 `tests/integration/` — they mock `litellm.completion` the same way.
 
 ## Testing
-
 ```bash
 pytest tests/ -q             # full suite (31 tests)
 pytest tests/unit -q         # fast unit layer
@@ -534,7 +494,6 @@ ruff check prompt_opt tests  # lint (currently clean)
 ```
 
 ## Project Structure
-
 ```
 prompt-optimization/
 ├── data/                          # runtime artifacts (mostly gitignored)
@@ -561,7 +520,6 @@ prompt-optimization/
 ```
 
 ## Troubleshooting
-
 | Symptom | Cause / Fix |
 |---------|-------------|
 | `No LLM provider API key found` | Set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` in `.env`. |
