@@ -11,11 +11,10 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
 
 from sqlalchemy import Column, DateTime, Float, String, Text, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from datetime import datetime
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 logger = logging.getLogger(__name__)
 

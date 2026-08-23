@@ -1,9 +1,9 @@
-import pytest
 from unittest.mock import MagicMock, patch
-from prompt_opt.eval.harness import EvalHarness, PromptCandidate
+
 from prompt_opt.eval.cache import EvalCache
+from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole
-from prompt_opt.judge.judge import LLMJudge, JudgeResult
+from prompt_opt.judge.judge import JudgeResult
 
 
 @patch("litellm.completion")

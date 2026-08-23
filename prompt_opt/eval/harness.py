@@ -17,13 +17,12 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Literal
 
 from prompt_opt.config import settings
 from prompt_opt.eval.cache import EvalCache
-from prompt_opt.eval.guardrails import GuardrailChecker, GuardrailResult, RegressionCase
-from prompt_opt.eval.metrics import EvalSummary, PerExampleResult, compute_eval_summary, _outcome
-from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole
+from prompt_opt.eval.guardrails import GuardrailChecker, RegressionCase
+from prompt_opt.eval.metrics import EvalSummary, PerExampleResult, _outcome, compute_eval_summary
+from prompt_opt.ingestion.schema import ConversationRecord, MessageRole
 from prompt_opt.judge.judge import LLMJudge
 
 logger = logging.getLogger(__name__)
@@ -81,9 +80,9 @@ def _replay_conversation(
         messages.pop()
 
     try:
-        import litellm  # type: ignore[import]
+        from prompt_opt.llm import get_litellm
 
-        resp = litellm.completion(
+        resp = get_litellm().completion(
             model=model,
             messages=messages,
             temperature=0.0,
@@ -192,7 +191,10 @@ class EvalHarness:
                     self.judge_version,
                     self.optimizee_model,
                     challenger_score,
-                    score_breakdown={"response_text": challenger_text, **judge_result.scores_dict()},
+                    score_breakdown={
+                        "response_text": challenger_text,
+                        **judge_result.scores_dict(),
+                    },
                     rationale=rationale,
                 )
 
@@ -219,6 +221,8 @@ class EvalHarness:
                     champion_score=champ_score,
                     outcome=outcome,
                     judge_rationale=rationale,
+                    response_text=challenger_text,
+                    champion_response_text=champ_text,
                 )
             )
 

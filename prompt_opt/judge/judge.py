@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -63,9 +63,12 @@ class PairwiseJudgeResult:
 # ─── Prompt templates ─────────────────────────────────────────────────────────
 
 _PAIRWISE_SYSTEM = """\
-You are an expert evaluator of AI assistant responses. Your task is to compare two responses to a user conversation and decide which is better, using the provided rubric.
+You are an expert evaluator of AI assistant responses.
+Your task is to compare two responses to a user conversation and decide
+which is better, using the provided rubric.
 
-Be objective. Focus on quality, not style preference. Your evaluation must be grounded in the rubric dimensions provided.
+Be objective. Focus on quality, not style preference.
+Your evaluation must be grounded in the rubric dimensions provided.
 
 Respond ONLY with a JSON object matching this exact schema:
 {
@@ -141,7 +144,10 @@ def _format_conversation(conv: ConversationRecord) -> str:
 def _format_rubric(rubric: Rubric) -> str:
     lines = [f"Mode: {rubric.mode}"]
     for dim in rubric.dimensions:
-        lines.append(f"- **{dim.name}** (weight={dim.weight:.1f}, scale=1–{dim.scale}): {dim.description}")
+        lines.append(
+            f"- **{dim.name}** (weight={dim.weight:.1f}, scale=1–{dim.scale}): "
+            f"{dim.description}"
+        )
     return "\n".join(lines)
 
 
@@ -240,21 +246,18 @@ class LLMJudge:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def _call_llm(self, system: str, user: str) -> str:
         """Make a single LLM call via litellm with retry on transient failures."""
-        try:
-            import litellm  # type: ignore[import]
+        from prompt_opt.llm import get_litellm
 
-            resp = litellm.completion(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            return resp.choices[0].message.content or ""
-        except Exception:
-            raise
+        resp = get_litellm().completion(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        return resp.choices[0].message.content or ""
 
     def score_pairwise(
         self,
@@ -369,10 +372,9 @@ class LLMJudge:
                 )
             )
 
-        aggregate = rubric.aggregate_scores({ds.dimension: ds.score for ds in dim_scores}) \
-            if False else self.rubric.aggregate_scores(
-                {ds.dimension: ds.score for ds in dim_scores}
-            )
+        aggregate = self.rubric.aggregate_scores(
+            {ds.dimension: ds.score for ds in dim_scores}
+        )
 
         return JudgeResult(
             dimension_scores=dim_scores,

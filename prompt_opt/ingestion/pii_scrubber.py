@@ -17,7 +17,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import spacy as SpacyLib
+    import spacy
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class ScrubResult:
 
 
 @lru_cache(maxsize=1)
-def _load_nlp() -> "SpacyLib.Language | None":
+def _load_nlp() -> spacy.Language | None:
     """Lazy-load spaCy model; returns None if unavailable (graceful degradation)."""
     try:
         import spacy  # type: ignore[import]

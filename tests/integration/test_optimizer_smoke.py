@@ -1,10 +1,10 @@
-import pytest
 from unittest.mock import MagicMock, patch
-from prompt_opt.optimizer.miprov2 import MIPROv2
+
 from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.metrics import EvalSummary
 from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole
 from prompt_opt.optimizer.budget import BudgetController
+from prompt_opt.optimizer.miprov2 import MIPROv2
 
 
 @patch("prompt_opt.optimizer.miprov2._call_proposer")

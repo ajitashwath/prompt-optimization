@@ -95,6 +95,58 @@ class CanaryController:
         import random
         self._rng = random.Random()
 
+    # ── Persistence / resume ─────────────────────────────────────────────────
+
+    @classmethod
+    def load(
+        cls,
+        state_path: str = "./data/canary_state.json",
+        max_guardrail_breaches: int = 5,
+    ) -> CanaryController:
+        """
+        Reconstruct a controller from a persisted state file.
+
+        Raises FileNotFoundError if no rollout was ever started at state_path.
+        """
+        path = Path(state_path)
+        if not path.exists():
+            raise FileNotFoundError(f"No canary state found at {path}")
+
+        with open(path) as fh:
+            data = json.load(fh)
+
+        stages = [
+            CanaryStage(
+                traffic_pct=s["traffic_pct"],
+                soak_seconds=s["soak_seconds"],
+                started_at=s["started_at"],
+                requests_seen=s.get("requests_seen", 0),
+                guardrail_breaches=s.get("guardrail_breaches", 0),
+            )
+            for s in data.get("stages", [])
+        ]
+
+        ctrl = cls.__new__(cls)
+        ctrl.ramp = [(s.traffic_pct, s.soak_seconds) for s in stages] or DEFAULT_RAMP
+        ctrl.state_path = path
+        ctrl.max_breaches = max_guardrail_breaches
+        ctrl.state = CanaryState(
+            challenger_hash=data["challenger_hash"],
+            champion_hash=data["champion_hash"],
+            stage_idx=data["stage_idx"],
+            status=data["status"],
+            stages=stages,
+            started_at=data["started_at"],
+            halt_reason=data.get("halt_reason"),
+        )
+        import random
+
+        ctrl._rng = random.Random()
+        logger.info("Resumed canary %s → %s (stage %d, status=%s)",
+                    ctrl.state.champion_hash, ctrl.state.challenger_hash,
+                    ctrl.state.stage_idx, ctrl.state.status)
+        return ctrl
+
     @property
     def current_stage(self) -> CanaryStage:
         return self.state.stages[self.state.stage_idx]
@@ -108,7 +160,9 @@ class CanaryController:
         if self.state.status != "active":
             return False
         self.current_stage.requests_seen += 1
-        return self._rng.randint(1, 100) <= self.current_stage.traffic_pct
+        use_challenger = self._rng.randint(1, 100) <= self.current_stage.traffic_pct
+        self._save_state()
+        return use_challenger
 
     def record_guardrail_breach(self) -> None:
         """Call this when a real-time guardrail metric fires."""
@@ -120,6 +174,8 @@ class CanaryController:
         )
         if self.current_stage.guardrail_breaches >= self.max_breaches:
             self.halt("Too many guardrail breaches")
+        else:
+            self._save_state()
 
     def maybe_advance(self) -> bool:
         """
@@ -182,6 +238,16 @@ class CanaryController:
                     "current_pct": self.current_stage.traffic_pct
                     if self.state.status == "active"
                     else 0,
+                    "stages": [
+                        {
+                            "traffic_pct": s.traffic_pct,
+                            "soak_seconds": s.soak_seconds,
+                            "started_at": s.started_at,
+                            "requests_seen": s.requests_seen,
+                            "guardrail_breaches": s.guardrail_breaches,
+                        }
+                        for s in self.state.stages
+                    ],
                 },
                 fh,
                 indent=2,

@@ -1,5 +1,4 @@
-import pytest
-from prompt_opt.gate.statistical import run_statistical_tests, paired_bootstrap_ci
+from prompt_opt.gate.statistical import paired_bootstrap_ci, run_statistical_tests
 
 
 def test_bootstrap_ci_simple():

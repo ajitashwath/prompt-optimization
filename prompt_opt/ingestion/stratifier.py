@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import random
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from prompt_opt.ingestion.schema import ConversationRecord, DataSplit, DifficultyBand
 

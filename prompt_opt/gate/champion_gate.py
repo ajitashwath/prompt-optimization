@@ -16,15 +16,14 @@ Gate result is immutable once computed and is attached to the prompt registry en
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
 from prompt_opt.config import settings
-from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.guardrails import GuardrailChecker, RegressionCase
+from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.metrics import EvalSummary
 from prompt_opt.gate.statistical import StatTestResult, run_statistical_tests
 from prompt_opt.ingestion.schema import ConversationRecord
@@ -81,6 +80,34 @@ class GateResult:
     human_reviewer: str | None = None
     human_notes: str | None = None
 
+    def record_human_review(
+        self,
+        reviewer: str,
+        notes: str = "",
+        approved: bool = True,
+    ) -> GateResult:
+        """
+        Record a human spot-check decision on this result.
+
+        Mutates decision PENDING_HUMAN → PASS (approved) or FAIL (rejected).
+        """
+        if self.decision != "PENDING_HUMAN":
+            raise ValueError(f"Gate is not pending human review (status={self.decision})")
+
+        self.human_approved = approved
+        self.human_reviewer = reviewer
+        self.human_notes = notes
+
+        if approved:
+            self.decision = "PASS"
+            logger.info("Gate APPROVED by %s: %s", reviewer, notes)
+        else:
+            self.decision = "FAIL"
+            self.failure_reasons.append(f"Human reviewer {reviewer!r} rejected: {notes}")
+            logger.info("Gate REJECTED by %s: %s", reviewer, notes)
+
+        return self
+
     def to_dict(self) -> dict:
         return {
             "decision": self.decision,
@@ -132,7 +159,6 @@ class ChampionGate:
         n: int,
     ) -> list[dict]:
         """Pick n head-to-heads from the test set for human review."""
-        import random
 
         examples = challenger_eval.per_example[:n]
         spot_items = []
@@ -180,7 +206,22 @@ class ChampionGate:
         failure_reasons: list[str] = []
         criteria_checks: list[dict] = []
 
-        # ── Evaluate challenger on test split ────────────────────────────────
+        # ── Establish champion baseline responses ────────────────────────────
+        # Paired comparison (same inputs, both prompts) is required for the
+        # statistical tests. If pre-computed champion responses were not
+        # supplied, evaluate the champion first and reuse its response texts.
+        champion_eval = None
+        if not champion_responses:
+            champion_eval = self.harness.evaluate(
+                champion, test_conversations, split="test"
+            )
+            champion_responses = {
+                ex.example_id: ex.response_text
+                for ex in champion_eval.per_example
+                if ex.response_text
+            }
+
+        # ── Evaluate challenger on test split (paired vs champion) ──────────
         challenger_eval = self.harness.evaluate(
             challenger,
             test_conversations,
@@ -188,13 +229,6 @@ class ChampionGate:
             champion_responses=champion_responses,
             regression_data=regression_responses,
         )
-
-        # ── Evaluate champion baseline (if no pre-computed responses) ────────
-        champion_eval = None
-        if not champion_responses:
-            champion_eval = self.harness.evaluate(
-                champion, test_conversations, split="test"
-            )
 
         # ── Statistical test ─────────────────────────────────────────────────
         outcomes = [ex.outcome or "tie" for ex in challenger_eval.per_example]
@@ -312,19 +346,6 @@ class ChampionGate:
         approved: bool = True,
     ) -> GateResult:
         """Record human spot-check decision. Call this after human review."""
-        if gate_result.decision != "PENDING_HUMAN":
-            raise ValueError(f"Gate is not pending human review (status={gate_result.decision})")
-
-        gate_result.human_approved = approved
-        gate_result.human_reviewer = reviewer
-        gate_result.human_notes = notes
-
-        if approved:
-            gate_result.decision = "PASS"
-            logger.info("Gate APPROVED by %s: %s", reviewer, notes)
-        else:
-            gate_result.decision = "FAIL"
-            gate_result.failure_reasons.append(f"Human reviewer {reviewer!r} rejected: {notes}")
-            logger.info("Gate REJECTED by %s: %s", reviewer, notes)
-
-        return gate_result
+        return gate_result.record_human_review(
+            reviewer=reviewer, notes=notes, approved=approved
+        )

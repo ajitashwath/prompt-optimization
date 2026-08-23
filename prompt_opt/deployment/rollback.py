@@ -14,9 +14,9 @@ Trigger conditions:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
 
 from prompt_opt.registry.prompt_registry import PromptRegistry
 
@@ -110,12 +110,17 @@ class RollbackMonitor:
                     f"error_rate={error_rate:.3f} > max={self.config.max_error_rate}"
                 )
 
-        if latency_ms_current is not None and latency_ms_baseline is not None and latency_ms_baseline > 0:
+        if (
+            latency_ms_current is not None
+            and latency_ms_baseline is not None
+            and latency_ms_baseline > 0
+        ):
             pct_increase = (latency_ms_current - latency_ms_baseline) / latency_ms_baseline
             metric_values["latency_regression_pct"] = pct_increase
             if pct_increase > self.config.max_latency_regression_pct:
                 triggers.append(
-                    f"latency regression={pct_increase:.1%} > max={self.config.max_latency_regression_pct:.1%}"
+                    f"latency regression={pct_increase:.1%} > "
+                    f"max={self.config.max_latency_regression_pct:.1%}"
                 )
 
         if refusal_rate is not None and refusal_rate_baseline is not None:
@@ -130,14 +135,16 @@ class RollbackMonitor:
             metric_values["format_compliance_rate"] = format_compliance_rate
             if format_compliance_rate < self.config.min_format_compliance_rate:
                 triggers.append(
-                    f"format_compliance={format_compliance_rate:.3f} < min={self.config.min_format_compliance_rate}"
+                    f"format_compliance={format_compliance_rate:.3f} < "
+                    f"min={self.config.min_format_compliance_rate}"
                 )
 
         if regression_pass_rate is not None:
             metric_values["regression_pass_rate"] = regression_pass_rate
             if regression_pass_rate < self.config.min_regression_pass_rate:
                 triggers.append(
-                    f"regression_pass_rate={regression_pass_rate:.3f} < min={self.config.min_regression_pass_rate}"
+                    f"regression_pass_rate={regression_pass_rate:.3f} < "
+                    f"min={self.config.min_regression_pass_rate}"
                 )
 
         if not triggers:

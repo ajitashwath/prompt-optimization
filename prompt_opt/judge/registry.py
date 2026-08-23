@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 
 from prompt_opt.judge.calibrator import CalibrationReport
-from prompt_opt.labeling.rubric import Rubric
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +83,8 @@ class JudgeRegistry:
         """
         if not calibration_report.passed:
             raise ValueError(
-                f"Cannot freeze a judge that failed calibration: {calibration_report.failure_reasons}"
+                f"Cannot freeze a judge that failed calibration: "
+                f"{calibration_report.failure_reasons}"
             )
 
         n = len(self._versions) + 1
@@ -100,7 +100,12 @@ class JudgeRegistry:
         )
         self._versions[version_id] = jv.to_dict()
         self._save()
-        logger.info("Frozen judge version %s (model=%s, rubric=%s)", version_id, model, rubric_version)
+        logger.info(
+            "Frozen judge version %s (model=%s, rubric=%s)",
+            version_id,
+            model,
+            rubric_version,
+        )
         return jv
 
     def get(self, version_id: str) -> JudgeVersion | None:

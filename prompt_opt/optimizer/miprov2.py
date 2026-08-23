@@ -25,14 +25,13 @@ from __future__ import annotations
 import json
 import logging
 import random
-from typing import Any
 
 from prompt_opt.config import settings
 from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.metrics import EvalSummary
 from prompt_opt.ingestion.schema import ConversationRecord
 from prompt_opt.optimizer.base import OptimizerStrategy
-from prompt_opt.optimizer.budget import BudgetExceededError, BudgetController
+from prompt_opt.optimizer.budget import BudgetController, BudgetExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +81,9 @@ def _call_proposer(
     """Ask the proposer LLM for instruction variants. Returns list of prompt strings."""
     model = model or settings.proposer_model
     try:
-        import litellm  # type: ignore[import]
+        from prompt_opt.llm import get_litellm
 
-        resp = litellm.completion(
+        resp = get_litellm().completion(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -267,7 +266,10 @@ class MIPROv2(OptimizerStrategy):
             )
             budget.record_call(n_calls=self.minibatch_size)
         except BudgetExceededError:
-            return [(initial_prompt, harness.evaluate(initial_prompt, dev_conversations[:5], split="dev"))]
+            fallback_eval = harness.evaluate(
+                initial_prompt, dev_conversations[:5], split="dev"
+            )
+            return [(initial_prompt, fallback_eval)]
 
         # Phase 1: Bootstrap demos
         try:
@@ -296,7 +298,7 @@ class MIPROv2(OptimizerStrategy):
         all_candidates: list[tuple[PromptCandidate, float]] = []
 
         # ── Optuna TPE study ─────────────────────────────────────────────────
-        def objective(trial: "optuna.Trial") -> float:
+        def objective(trial: optuna.Trial) -> float:
             instr_idx = trial.suggest_int("instr_idx", 0, len(instruction_variants) - 1)
             demo_idx = trial.suggest_int("demo_idx", 0, len(demo_subsets) - 1)
 
@@ -318,7 +320,13 @@ class MIPROv2(OptimizerStrategy):
                     score *= 0.5  # penalise guardrail violations
 
                 all_candidates.append((candidate, score))
-                logger.info("Trial %d: score=%.4f (instr=%d, demo=%d)", trial.number, score, instr_idx, demo_idx)
+                logger.info(
+                    "Trial %d: score=%.4f (instr=%d, demo=%d)",
+                    trial.number,
+                    score,
+                    instr_idx,
+                    demo_idx,
+                )
                 return score
 
             except BudgetExceededError as e:

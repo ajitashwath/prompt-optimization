@@ -17,9 +17,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
 
-from prompt_opt.config import settings
 from prompt_opt.judge.calibrator import JudgeCalibrator
 from prompt_opt.judge.judge import LLMJudge
 from prompt_opt.labeling.gold_store import GoldStore

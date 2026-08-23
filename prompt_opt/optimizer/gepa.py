@@ -23,15 +23,14 @@ from __future__ import annotations
 import json
 import logging
 import random
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from prompt_opt.config import settings
 from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.metrics import EvalSummary
 from prompt_opt.ingestion.schema import ConversationRecord
 from prompt_opt.optimizer.base import OptimizerStrategy
-from prompt_opt.optimizer.budget import BudgetExceededError, BudgetController
+from prompt_opt.optimizer.budget import BudgetController, BudgetExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -367,14 +366,22 @@ class GEPA(OptimizerStrategy):
             population = self._initialize_population(initial_prompt, budget)
         except BudgetExceededError:
             logger.warning("Budget exhausted during GEPA init")
-            return [(initial_prompt, harness.evaluate(initial_prompt, dev_conversations[:5], split="dev"))]
+            fallback_eval = harness.evaluate(
+                initial_prompt, dev_conversations[:5], split="dev"
+            )
+            return [(initial_prompt, fallback_eval)]
 
         all_individuals: list[Individual] = []
         stagnation_count = 0
         prev_front_size = 0
 
         for gen in range(self.max_generations):
-            logger.info("GEPA Generation %d/%d (pop=%d)", gen + 1, self.max_generations, len(population))
+            logger.info(
+                "GEPA Generation %d/%d (pop=%d)",
+                gen + 1,
+                self.max_generations,
+                len(population),
+            )
 
             # Evaluate unevaluated individuals
             try:
@@ -391,7 +398,11 @@ class GEPA(OptimizerStrategy):
 
             if len(front) == prev_front_size:
                 stagnation_count += 1
-                logger.info("GEPA: Pareto front stagnated (%d/%d)", stagnation_count, self.stagnation_limit)
+                logger.info(
+                    "GEPA: Pareto front stagnated (%d/%d)",
+                    stagnation_count,
+                    self.stagnation_limit,
+                )
             else:
                 stagnation_count = 0
                 prev_front_size = len(front)
@@ -441,7 +452,10 @@ class GEPA(OptimizerStrategy):
         ]
 
         if not results:
-            results = [(initial_prompt, harness.evaluate(initial_prompt, dev_conversations[:5], split="dev"))]
+            fallback_eval = harness.evaluate(
+                initial_prompt, dev_conversations[:5], split="dev"
+            )
+            results = [(initial_prompt, fallback_eval)]
 
         logger.info(
             "GEPA complete: %d on Pareto front, best overall=%.4f (budget: %s)",

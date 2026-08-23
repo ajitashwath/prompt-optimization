@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -63,12 +63,12 @@ class ShadowRunner:
         """Call the model; returns (response_text, latency_ms)."""
         import time
 
-        import litellm  # type: ignore[import]
+        from prompt_opt.llm import get_litellm
 
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         t0 = time.perf_counter()
         try:
-            resp = litellm.completion(
+            resp = get_litellm().completion(
                 model=self.model,
                 messages=full_messages,
                 temperature=0.0,

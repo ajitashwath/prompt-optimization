@@ -1,4 +1,3 @@
-import pytest
 from prompt_opt.ingestion.pii_scrubber import scrub
 
 

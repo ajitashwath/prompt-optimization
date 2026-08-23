@@ -1,5 +1,4 @@
-import pytest
-from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole, DataSplit
+from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole
 from prompt_opt.ingestion.stratifier import stratify
 
 

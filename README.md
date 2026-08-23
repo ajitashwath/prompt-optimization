@@ -87,23 +87,43 @@ A closed-loop system that automatically evolves an LLM's system prompt (and few-
 
 ## CLI Usage
 
-Verify all stages of the pipeline:
+The full closed loop, from raw logs to deployed prompt:
 
 ```bash
-# Ingest raw logs
+# 1. Ingest raw logs → PII-scrub → dedup → stratify → persist splits to ./data/splits
 python -m prompt_opt.cli.main ingest --input-file data/sample_conversations.jsonl
 
-# Launch Human Labeling Studio
+# 2. Launch Human Labeling Studio (annotate pairs for judge calibration)
 python -m prompt_opt.cli.main studio --port 8000
+python -m prompt_opt.cli.main add-gold --conversation-id c1 --response-a "..." --response-b "..."
 
-# Calibrate judge against gold annotated set
+# 3. Calibrate judge against the gold annotated set (freezes judge if passed)
 python -m prompt_opt.cli.main calibrate-judge
 
-# Run optimizer run (MIPROv2/GEPA)
-python -m prompt_opt.cli.main optimize --algorithm miprov2 --n-trials 5
+# 4. Run optimizer over persisted train/dev splits; registers best candidate
+python -m prompt_opt.cli.main optimize --algorithm miprov2 --n-trials 5   # or: gepa
 
-# Evaluate gate promotion
-python -m prompt_opt.cli.main gate --challenger-hash abc --champion-hash 123
+# 5. Evaluate challenger vs champion on the frozen test split (+ regression suite)
+#    PASS → auto-promote; PENDING_HUMAN → review spot-check items, then approve
+python -m prompt_opt.cli.main gate --challenger-hash <hash> [--skip-human-review]
+python -m prompt_opt.cli.main gate-approve --reviewer alice [--reject]
+
+# 6. Shadow-mode: serve champion, log challenger responses side-by-side
+python -m prompt_opt.cli.main shadow --challenger-hash <hash> --n 5
+
+# 7. Staged canary rollout with guardrail halts
+python -m prompt_opt.cli.main canary start --challenger-hash <hash> --champion-hash <hash>
+python -m prompt_opt.cli.main canary status | advance | breach | rollback
+
+# 8. Live-metric rollback monitor (auto-reverts registry champion on breach)
+python -m prompt_opt.cli.main monitor --error-rate 0.06
+
+# 9. Drift detection over production score distributions
+python -m prompt_opt.cli.main drift-check --baseline-file scores.json --scores-file recent.json
+
+# 10. Continuous feedback loop (cron-driven ingest + re-optimization)
+python -m prompt_opt.cli.main loop          # scheduled via reingest_cron / reoptimize_cron
+python -m prompt_opt.cli.main loop --once   # single cycle
 ```
 
 ---

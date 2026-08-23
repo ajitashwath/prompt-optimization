@@ -26,6 +26,8 @@ class PerExampleResult:
     champion_score: float | None
     outcome: Literal["win", "loss", "tie"] | None  # relative to challenger
     judge_rationale: str = ""
+    response_text: str = ""            # challenger's generated response
+    champion_response_text: str | None = None  # champion's response (paired mode)
 
 
 @dataclass
@@ -102,7 +104,9 @@ class EvalSummary:
         }
 
 
-def _outcome(challenger: float, champion: float, margin: float = 0.02) -> Literal["win", "loss", "tie"]:
+def _outcome(
+    challenger: float, champion: float, margin: float = 0.02
+) -> Literal["win", "loss", "tie"]:
     if challenger > champion + margin:
         return "win"
     if champion > challenger + margin:
@@ -165,8 +169,16 @@ def compute_eval_summary(
                 category=cat,
                 n=len(items),
                 mean_score=float(np.mean(cat_scores)),
-                win_rate=sum(1 for o in cat_outcomes if o == "win") / n_cat_out if n_cat_out else None,
-                loss_rate=sum(1 for o in cat_outcomes if o == "loss") / n_cat_out if n_cat_out else None,
+                win_rate=(
+                    sum(1 for o in cat_outcomes if o == "win") / n_cat_out
+                    if n_cat_out
+                    else None
+                ),
+                loss_rate=(
+                    sum(1 for o in cat_outcomes if o == "loss") / n_cat_out
+                    if n_cat_out
+                    else None
+                ),
             )
         )
 

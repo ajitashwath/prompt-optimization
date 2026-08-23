@@ -18,7 +18,6 @@ from prompt_opt.ingestion.deduplicator import DedupResult, deduplicate
 from prompt_opt.ingestion.pii_scrubber import scrub
 from prompt_opt.ingestion.schema import (
     ConversationRecord,
-    DataSplit,
     DifficultyBand,
     Message,
     MessageRole,
@@ -129,7 +128,11 @@ class Ingestor:
             else:
                 scrubbed_messages.append(msg)
         return conv.model_copy(
-            update={"messages": scrubbed_messages, "pii_scrubbed": True, "ingested_at": datetime.utcnow()}
+            update={
+                "messages": scrubbed_messages,
+                "pii_scrubbed": True,
+                "ingested_at": datetime.utcnow(),
+            }
         )
 
     def _enrich_record(self, conv: ConversationRecord) -> ConversationRecord:

@@ -1,8 +1,8 @@
-import pytest
 from unittest.mock import MagicMock, patch
-from prompt_opt.judge.calibrator import JudgeCalibrator, CalibrationReport
-from prompt_opt.labeling.gold_store import GoldLabel, GoldStore
-from prompt_opt.judge.judge import LLMJudge, PairwiseJudgeResult, JudgeResult
+
+from prompt_opt.judge.calibrator import JudgeCalibrator
+from prompt_opt.judge.judge import PairwiseJudgeResult
+from prompt_opt.labeling.gold_store import GoldLabel
 from prompt_opt.labeling.rubric import DEFAULT_RUBRIC
 
 
@@ -52,14 +52,13 @@ def test_calibrator_agreement_metrics(mock_store, mock_judge):
     mock_judge.score_pairwise.side_effect = [jr1, jr2]
 
     calibrator = JudgeCalibrator(mock_judge, mock_store)
-    # We calibrate with at least 2 items (normally requires >= 5, but we can override min check or pass dummy list)
-    # Let's bypass minimum item check by providing a list of 5 copies of items to guarantee calculation
+    # Normally requires >= 5 items; provide 6 copies so metrics are computable
     mock_store.get_labeled.return_value = [item1, item1, item1, item2, item2, item2]
     mock_judge.score_pairwise.side_effect = [jr1, jr1, jr1, jr2, jr2, jr2]
 
     report = calibrator.calibrate(rubric_version=DEFAULT_RUBRIC.version)
 
     assert report.n_items == 6
-    assert report.agreement_rate == 1.0  # Perfect agreement since mock labels and judge choices match perfectly
+    assert report.agreement_rate == 1.0  # judge choices match human labels exactly
     assert report.kappa == 1.0
     assert report.passed is True

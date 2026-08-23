@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Pipeline runtime artifacts (sample data stays tracked)
+data/splits/
+data/gate_results/
+data/shadow_logs/
+data/canary_state.json
+data/prompt_opt.db
+data/raw_production_logs.jsonl
+*.sqlite3

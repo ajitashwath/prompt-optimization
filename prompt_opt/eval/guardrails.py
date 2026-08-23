@@ -17,8 +17,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
+from pathlib import Path
 
 import numpy as np
 from scipy import stats
@@ -80,6 +81,36 @@ class RegressionCase:
     expected_content: str | None = None   # exact match (stripped)
     expected_format: str | None = None    # "json" etc.
     description: str = ""
+    messages: list[dict] = field(default_factory=list)  # raw turns for live replay
+
+
+def load_regression_suite(path: str | Path) -> list[RegressionCase]:
+    """
+    Load regression cases from a JSONL file.
+
+    Extra metadata fields in each row (e.g. test_type, messages, category)
+    are ignored; only RegressionCase fields are consumed.
+    """
+    from dataclasses import fields as dc_fields
+
+    known = {f.name for f in dc_fields(RegressionCase)}
+    cases: list[RegressionCase] = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.warning("Regression suite line %d parse error: %s", lineno, exc)
+                continue
+            try:
+                cases.append(RegressionCase(**{k: v for k, v in data.items() if k in known}))
+            except TypeError as exc:
+                logger.warning("Regression suite line %d invalid: %s", lineno, exc)
+    logger.info("Loaded %d regression cases from %s", len(cases), path)
+    return cases
 
 
 def check_regression_case(case: RegressionCase, response: str) -> tuple[bool, str]:

@@ -20,9 +20,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
-from sqlalchemy import Boolean, Column, DateTime, String, Text, create_engine, select
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 logger = logging.getLogger(__name__)
@@ -30,6 +29,23 @@ logger = logging.getLogger(__name__)
 
 class _Base(DeclarativeBase):
     pass
+
+
+class ChampionEventRow(_Base):
+    """
+    Append-only audit log of champion transitions.
+
+    Only "promote" events define the champion succession chain used by
+    rollback(); "rollback" events are recorded for observability only.
+    """
+
+    __tablename__ = "champion_events"
+
+    event_id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(String, nullable=False, index=True)
+    action = Column(String, nullable=False)  # "promote" | "rollback"
+    actor = Column(String, nullable=False, default="system")
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class PromptVersionRow(_Base):
@@ -190,41 +206,74 @@ class PromptRegistry:
             row.approval_record_json = json.dumps(
                 {"approver": approver, "approved_at": datetime.utcnow().isoformat()}
             )
+            session.add(
+                ChampionEventRow(version_id=version_id, action="promote", actor=approver)
+            )
             session.commit()
             logger.info("Promoted %s to champion (approved by %s)", version_id, approver)
 
-    def rollback(self) -> str | None:
+    def rollback(self, actor: str = "system") -> str | None:
         """
-        Rollback to the previous champion.
+        Rollback to the version promoted immediately before the current champion.
 
-        Returns the version_id of the new (reverted) champion, or None if no history.
+        The champion succession chain is derived exclusively from the
+        "promote" events in the audit log — `deployed_at` timestamps are never
+        rewritten, so history cannot be corrupted by repeated rollbacks.
+
+        Returns the version_id of the reverted-to champion, or None if the
+        current champion has no predecessor (i.e. nothing to roll back to).
         """
         with self._Session() as session:
-            # Get all deployed versions in order
-            rows = session.scalars(
-                select(PromptVersionRow)
-                .where(PromptVersionRow.deployed_at.is_not(None))
-                .order_by(PromptVersionRow.deployed_at.desc())
-            ).all()
-
-            if len(rows) < 2:
-                logger.warning("No previous version to roll back to")
+            current = session.scalars(
+                select(PromptVersionRow).where(PromptVersionRow.is_champion == True)  # noqa: E712
+            ).first()
+            if current is None:
+                logger.warning("No champion set; nothing to roll back")
                 return None
 
-            # rows[0] is current champion; rows[1] is previous
-            current = rows[0]
-            previous = rows[1]
+            promote_events = session.scalars(
+                select(ChampionEventRow)
+                .where(ChampionEventRow.action == "promote")
+                .order_by(ChampionEventRow.event_id.asc())
+            ).all()
+
+            # Collapse consecutive promotions of the same version into one step.
+            chain: list[str] = []
+            for ev in promote_events:
+                if not chain or chain[-1] != ev.version_id:
+                    chain.append(ev.version_id)
+
+            # Find where the current champion entered the chain; its
+            # predecessor is the rollback target.
+            try:
+                idx = len(chain) - 1 - chain[::-1].index(current.version_id)
+            except ValueError:
+                logger.warning(
+                    "Champion %s has no recorded promotion event", current.version_id
+                )
+                return None
+
+            if idx == 0:
+                logger.warning(
+                    "No previous version to roll back to (champion %s is the first)",
+                    current.version_id,
+                )
+                return None
+
+            target_id = chain[idx - 1]
+            previous = session.get(PromptVersionRow, target_id)
+            if previous is None:
+                logger.error("Rollback target %s missing from registry", target_id)
+                return None
 
             current.is_champion = False
             previous.is_champion = True
-            previous.deployed_at = datetime.utcnow()
-            session.commit()
-            logger.info(
-                "Rolled back: %s → %s (reverted champion)",
-                current.version_id,
-                previous.version_id,
+            session.add(
+                ChampionEventRow(version_id=target_id, action="rollback", actor=actor)
             )
-            return previous.version_id
+            session.commit()
+            logger.info("Rolled back: %s → %s", current.version_id, target_id)
+            return target_id
 
     def get_champion(self) -> PromptVersion | None:
         with self._Session() as session:
@@ -237,6 +286,33 @@ class PromptRegistry:
         with self._Session() as session:
             row = session.get(PromptVersionRow, version_id)
             return _row_to_version(row) if row else None
+
+    def get_by_content_hash(self, content_hash: str) -> PromptVersion | None:
+        """Resolve a registered version by its content hash (idempotent register key)."""
+        with self._Session() as session:
+            row = session.scalars(
+                select(PromptVersionRow).where(PromptVersionRow.content_hash == content_hash)
+            ).first()
+            return _row_to_version(row) if row else None
+
+    def champion_history(self, limit: int = 50) -> list[dict]:
+        """Return the audit log of champion promote/rollback events (newest first)."""
+        with self._Session() as session:
+            events = session.scalars(
+                select(ChampionEventRow)
+                .order_by(ChampionEventRow.event_id.desc())
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    "event_id": ev.event_id,
+                    "version_id": ev.version_id,
+                    "action": ev.action,
+                    "actor": ev.actor,
+                    "created_at": (ev.created_at or datetime.utcnow()).isoformat(),
+                }
+                for ev in events
+            ]
 
     def list_versions(self, limit: int = 20) -> list[PromptVersion]:
         with self._Session() as session:

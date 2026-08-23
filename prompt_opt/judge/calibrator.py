@@ -16,7 +16,6 @@ Output: CalibrationReport (serialisable dict/JSON).
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,8 +25,7 @@ from scipy import stats
 
 from prompt_opt.ingestion.schema import ConversationRecord
 from prompt_opt.judge.judge import LLMJudge, PairwiseJudgeResult
-from prompt_opt.labeling.gold_store import GoldLabel, GoldStore
-from prompt_opt.labeling.rubric import Rubric
+from prompt_opt.labeling.gold_store import GoldStore
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +43,14 @@ def _cohen_kappa(y1: list[int], y2: list[int]) -> float:
 
 
 def _spearman(x: list[float], y: list[float]) -> tuple[float, float]:
-    """Return (rho, p_value)."""
+    """Return (rho, p_value). Returns (0.0, 1.0) for constant inputs (undefined)."""
+    if len(set(x)) < 2 or len(set(y)) < 2:
+        return 0.0, 1.0
     result = stats.spearmanr(x, y)
-    return float(result.statistic), float(result.pvalue)
+    rho = float(result.statistic)
+    if np.isnan(rho):
+        return 0.0, 1.0
+    return rho, float(result.pvalue)
 
 
 def _pearson(x: list[float], y: list[float]) -> tuple[float, float]:
@@ -62,7 +65,7 @@ def _pearson(x: list[float], y: list[float]) -> tuple[float, float]:
 class BiasReport:
     length_bias_rho: float          # Spearman rho: judge_preference_score ~ len(winner)
     length_bias_pvalue: float
-    position_bias_rate: float       # fraction of items where judge preferred A just because it was first
+    position_bias_rate: float       # fraction of items where judge preferred A first
     style_bias_rho: float | None = None   # correlation with markdown presence (optional)
 
     @property

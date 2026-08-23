@@ -50,9 +50,9 @@ def _embed_conversation(conv: ConversationRecord, model: str) -> np.ndarray:
     ).strip() or f"[empty:{conv.conversation_id}]"
 
     try:
-        import litellm  # type: ignore[import]
+        from prompt_opt.llm import get_litellm
 
-        resp = litellm.embedding(model=model, input=[text])
+        resp = get_litellm().embedding(model=model, input=[text])
         vec = np.array(resp.data[0]["embedding"], dtype=np.float32)
     except Exception:
         # Fallback: random vector (for testing without API keys)

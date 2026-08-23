@@ -1,9 +1,8 @@
-import pytest
 from prompt_opt.eval.guardrails import (
+    RegressionCase,
+    check_regression_case,
     is_refusal,
     is_valid_json_response,
-    check_regression_case,
-    RegressionCase,
 )
 
 

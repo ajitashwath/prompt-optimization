@@ -12,7 +12,6 @@ or re-optimization in the feedback loop.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -167,7 +166,8 @@ class DriftDetector:
                     DriftEvent(
                         drift_type=DriftType.JUDGE_SCORE,
                         description=(
-                            f"Judge score distribution drifted: KL={kl:.4f} > threshold={self.kl_threshold}"
+                            f"Judge score distribution drifted: "
+                            f"KL={kl:.4f} > threshold={self.kl_threshold}"
                         ),
                         severity=severity,
                         metric_value=kl,
@@ -190,7 +190,11 @@ class DriftDetector:
                                 f"Refusal rate drifted: EMA={self._ema_refusal:.3f}, "
                                 f"baseline={self._baseline_refusal_rate:.3f}, delta={delta:.3f}"
                             ),
-                            severity="critical" if delta > self.refusal_rate_max_delta * 2 else "warning",
+                            severity=(
+                                "critical"
+                                if delta > self.refusal_rate_max_delta * 2
+                                else "warning"
+                            ),
                             metric_value=self._ema_refusal,
                             baseline_value=self._baseline_refusal_rate,
                             threshold=self.refusal_rate_max_delta,
@@ -205,7 +209,8 @@ class DriftDetector:
                     DriftEvent(
                         drift_type=DriftType.FORMAT_COMPLIANCE,
                         description=(
-                            f"Format compliance drifted: EMA={self._ema_format:.3f} < min={self.format_compliance_min}"
+                            f"Format compliance drifted: EMA={self._ema_format:.3f} "
+                            f"< min={self.format_compliance_min}"
                         ),
                         severity="critical",
                         metric_value=self._ema_format,
