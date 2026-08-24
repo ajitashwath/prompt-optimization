@@ -86,7 +86,7 @@ Genetic optimizers.
 
 ```bash
 # 1. Clone and enter the project
-git clone <repo-url>
+git clone https://github.com/ajitashwath/prompt-optimization.git
 cd prompt-optimization
 
 # 2. (recommended) create a virtual environment
