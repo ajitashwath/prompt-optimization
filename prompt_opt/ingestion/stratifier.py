@@ -108,13 +108,6 @@ def stratify(
     for key, recs in merged.items():
         rng.shuffle(recs)
 
-        # Oversample important buckets: duplicate records proportionally
-        oversample = any(_should_oversample(r) for r in recs)
-        if oversample and len(recs) > 1:
-            extras = rng.choices(recs, k=int(len(recs) * (oversample_factor - 1)))
-            recs = recs + extras
-            rng.shuffle(recs)
-
         n = len(recs)
         n_test = max(1, round(n * test_ratio))
         n_dev = max(1, round(n * dev_ratio))
@@ -126,19 +119,33 @@ def stratify(
             n_dev = max(0, (n - n_train - n_test))
             n_test = max(0, n - n_train - n_dev)
 
+        # Partition first so each record lands in exactly one split
+        train_chunk = recs[:n_train]
+        dev_chunk = recs[n_train : n_train + n_dev]
+        test_chunk = recs[n_train + n_dev : n_train + n_dev + n_test]
+
+        # Oversample rare/important buckets by duplicating train records only,
+        # never leaking copies into dev/test
+        oversample = any(_should_oversample(r) for r in recs)
+        if oversample and len(train_chunk) > 1:
+            extras = rng.choices(
+                train_chunk, k=int(len(train_chunk) * (oversample_factor - 1))
+            )
+            train_chunk = train_chunk + extras
+
         split_recs = [
-            (DataSplit.TRAIN, recs[:n_train]),
-            (DataSplit.DEV, recs[n_train : n_train + n_dev]),
-            (DataSplit.TEST, recs[n_train + n_dev : n_train + n_dev + n_test]),
+            (DataSplit.TRAIN, train_chunk),
+            (DataSplit.DEV, dev_chunk),
+            (DataSplit.TEST, test_chunk),
         ]
 
         for split, chunk in split_recs:
             for r in chunk:
                 r.split = split
 
-        train_all.extend(recs[:n_train])
-        dev_all.extend(recs[n_train : n_train + n_dev])
-        test_all.extend(recs[n_train + n_dev : n_train + n_dev + n_test])
+        train_all.extend(train_chunk)
+        dev_all.extend(dev_chunk)
+        test_all.extend(test_chunk)
 
     logger.info(
         "Stratification complete: train=%d, dev=%d, test=%d",
