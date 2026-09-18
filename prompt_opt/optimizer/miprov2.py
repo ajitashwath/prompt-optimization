@@ -3,8 +3,8 @@ MIPROv2 — Multi-prompt Instruction Proposal Optimizer (Bayesian variant).
 
 Algorithm:
   Phase 1 — Bootstrap demos
-    Run current prompt over train split; keep high-scoring examples
-    as candidate few-shot demonstrations.
+    Run current prompt over a train sample; keep the high-scoring *generated*
+    responses (the ones the judge actually scored) as candidate few-shot demos.
 
   Phase 2 — Instruction proposal
     Ask a "proposer" LLM to generate N diverse instruction rewrites,
@@ -12,10 +12,14 @@ Algorithm:
 
   Phase 3 — Bayesian search (TPE via Optuna)
     Joint search over (instruction_variant_idx × demo_subset_idx).
-    Each trial:
-      a. Score on a random minibatch of dev examples (cheap).
-      b. Track (candidate, score) in the Optuna study.
-    After all trials, full-dev evaluation for top-K survivors.
+    Each trial scores the candidate on ONE fixed dev minibatch (the same
+    examples for every trial, so scores are comparable and cache-friendly),
+    with guardrails checked against the initial prompt's responses.
+
+  Phase 4 — Final evaluation (shared, see OptimizerStrategy._final_stage)
+    The initial prompt and the top-K distinct candidates are evaluated on the
+    FULL dev split; the initial prompt is always in the result so callers can
+    tell whether anything beat it.
 
   Returns ranked list of (PromptCandidate, EvalSummary).
 """
@@ -26,11 +30,18 @@ import json
 import logging
 import random
 
+from prompt_opt import llm
 from prompt_opt.config import settings
-from prompt_opt.eval.harness import EvalHarness, PromptCandidate
+from prompt_opt.eval.guardrails import RegressionCase
+from prompt_opt.eval.harness import EvalHarness, EvaluationError, PromptCandidate
 from prompt_opt.eval.metrics import EvalSummary
 from prompt_opt.ingestion.schema import ConversationRecord
-from prompt_opt.optimizer.base import OptimizerStrategy
+from prompt_opt.optimizer.base import (
+    OptimizationError,
+    OptimizerStrategy,
+    empty_summary,
+    response_texts,
+)
 from prompt_opt.optimizer.budget import BudgetController, BudgetExceededError
 
 logger = logging.getLogger(__name__)
@@ -81,9 +92,7 @@ def _call_proposer(
     """Ask the proposer LLM for instruction variants. Returns list of prompt strings."""
     model = model or settings.proposer_model
     try:
-        from prompt_opt.llm import get_litellm
-
-        resp = get_litellm().completion(
+        resp = llm.completion(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -100,6 +109,8 @@ def _call_proposer(
         for key in parsed:
             if isinstance(parsed[key], list):
                 return [str(v) for v in parsed[key]]
+    except BudgetExceededError:
+        raise
     except Exception as exc:
         logger.warning("Proposer call failed: %s", exc)
     return []
@@ -114,9 +125,11 @@ class MIPROv2(OptimizerStrategy):
         n_demo_subsets:    How many different demo subsets to try.
         max_demos:         Max few-shot demos per candidate.
         n_trials:          Total Optuna trials (instruction × demo combos to try).
-        top_k:             After trials, do full-dev eval for top-K candidates.
-        minibatch_size:    Number of dev examples per trial (cheap pass).
+        top_k:             After trials, full-dev-evaluate the top-K distinct candidates.
+        minibatch_size:    Dev examples per trial (one fixed sample shared by all trials).
         task_summary:      Human description of the task (injected into proposer prompt).
+        regression_cases:  Regression suite replayed live for each finalist (optional).
+        seed:              Seed for minibatch / demo sampling and the TPE sampler.
     """
 
     def __init__(
@@ -129,6 +142,8 @@ class MIPROv2(OptimizerStrategy):
         top_k: int = 3,
         minibatch_size: int = 10,
         task_summary: str = "General AI assistant task",
+        regression_cases: list[RegressionCase] | None = None,
+        seed: int = 42,
     ):
         self.n_proposals = n_proposals
         self.n_demo_subsets = n_demo_subsets
@@ -137,6 +152,8 @@ class MIPROv2(OptimizerStrategy):
         self.top_k = top_k
         self.minibatch_size = minibatch_size
         self.task_summary = task_summary
+        self.regression_cases = regression_cases
+        self.seed = seed
 
     @property
     def name(self) -> str:
@@ -150,48 +167,50 @@ class MIPROv2(OptimizerStrategy):
         train_convs: list[ConversationRecord],
         harness: EvalHarness,
         budget: BudgetController,
+        rng: random.Random,
     ) -> list[list[dict]]:
         """
-        Run initial prompt on train split; keep high-scoring examples as demos.
-        Returns a list of demo subsets (each subset is a list of {user, assistant} dicts).
+        Run initial prompt on a train sample; keep the responses the judge scored highly.
+
+        Returns a list of demo subsets (each a list of {user, assistant} dicts). The first
+        subset is always the initial prompt's own demos, so combination (0, 0) of the
+        search space is exactly the initial prompt.
         """
+        subsets: list[list[dict]] = [list(initial_prompt.few_shot_demos or [])]
+        if not train_convs:
+            return subsets
+
         logger.info("Bootstrapping demos from %d train examples …", len(train_convs))
         budget.check()
 
-        sample = random.sample(train_convs, min(30, len(train_convs)))
-        eval_summary = harness.evaluate(initial_prompt, sample, split="train")
-        budget.record_call(n_calls=len(sample))
+        sample = rng.sample(train_convs, min(30, len(train_convs)))
+        by_id = {c.conversation_id: c for c in sample}
+        try:
+            eval_summary = harness.evaluate(initial_prompt, sample, split="train")
+        except EvaluationError as exc:
+            logger.warning("Demo bootstrapping skipped: %s", exc)
+            return subsets
 
-        # Collect high-scoring examples as candidate demos
+        # The demo's assistant turn is the GENERATED response that earned the score,
+        # not the historical log reply (which the judge never saw).
         good_examples: list[dict] = []
         for ex in eval_summary.per_example:
-            if ex.challenger_score >= _BOOTSTRAP_SCORE_THRESHOLD:
-                # Find the conv to extract user/assistant turns
-                for conv in sample:
-                    if conv.conversation_id == ex.example_id:
-                        user_turns = [m.content for m in conv.user_turns if m.content]
-                        asst_turns = [m.content for m in conv.assistant_turns if m.content]
-                        if user_turns and asst_turns:
-                            good_examples.append({
-                                "user": user_turns[-1],
-                                "assistant": asst_turns[-1],
-                            })
-                        break
+            if ex.challenger_score < _BOOTSTRAP_SCORE_THRESHOLD or not ex.response_text:
+                continue
+            conv = by_id.get(ex.example_id)
+            user_turns = [m.content for m in conv.user_turns if m.content] if conv else []
+            if user_turns:
+                good_examples.append({"user": user_turns[-1], "assistant": ex.response_text})
 
         logger.info("Found %d high-quality demo candidates", len(good_examples))
 
-        # Build demo subsets
-        demo_subsets: list[list[dict]] = [
-            []  # always include the no-demo option
-        ]
         if good_examples:
-            rng = random.Random(42)
+            demo_rng = random.Random(self.seed)
             for _ in range(self.n_demo_subsets - 1):
                 k = min(self.max_demos, len(good_examples))
-                subset = rng.sample(good_examples, k)
-                demo_subsets.append(subset)
+                subsets.append(demo_rng.sample(good_examples, k))
 
-        return demo_subsets
+        return subsets
 
     # ── Phase 2: Instruction proposal ────────────────────────────────────────
 
@@ -231,7 +250,6 @@ class MIPROv2(OptimizerStrategy):
         )
 
         variants = _call_proposer(system, user)
-        budget.record_call(n_calls=1, input_tokens=len(user) // 4, output_tokens=500)
 
         if not variants:
             logger.warning("No instruction variants returned; using current prompt")
@@ -242,7 +260,7 @@ class MIPROv2(OptimizerStrategy):
 
     # ── Phase 3: Bayesian search ──────────────────────────────────────────────
 
-    def optimize(
+    def _optimize(
         self,
         initial_prompt: PromptCandidate,
         train_conversations: list[ConversationRecord],
@@ -258,26 +276,28 @@ class MIPROv2(OptimizerStrategy):
             logger.error("optuna not installed — cannot run MIPROv2")
             raise
 
-        # Initial baseline eval
-        logger.info("Running initial baseline eval on dev split …")
+        rng = random.Random(self.seed)
+        # One fixed minibatch for every trial: candidate scores are comparable.
+        minibatch = rng.sample(
+            dev_conversations, min(self.minibatch_size, len(dev_conversations))
+        )
+
+        # Baseline on the minibatch: the guardrail baseline for every trial and the
+        # failure summary the proposer sees.
+        logger.info("Running initial baseline eval on the dev minibatch …")
         try:
-            baseline_eval = harness.evaluate(
-                initial_prompt, dev_conversations, split="dev", sample_size=self.minibatch_size
-            )
-            budget.record_call(n_calls=self.minibatch_size)
+            baseline_eval = harness.evaluate(initial_prompt, minibatch, split="dev")
         except BudgetExceededError:
-            fallback_eval = harness.evaluate(
-                initial_prompt, dev_conversations[:5], split="dev"
-            )
-            return [(initial_prompt, fallback_eval)]
+            return [(initial_prompt, empty_summary(harness, initial_prompt.content_hash))]
+        baseline_texts = response_texts(baseline_eval)
 
         # Phase 1: Bootstrap demos
         try:
             demo_subsets = self._bootstrap_demos(
-                initial_prompt, train_conversations, harness, budget
+                initial_prompt, train_conversations, harness, budget, rng
             )
         except BudgetExceededError:
-            demo_subsets = [[]]
+            demo_subsets = [list(initial_prompt.few_shot_demos or [])]
 
         # Phase 2: Instruction proposals
         try:
@@ -294,10 +314,15 @@ class MIPROv2(OptimizerStrategy):
             len(instruction_variants) * len(demo_subsets),
         )
 
-        # Track all evaluated candidates
-        all_candidates: list[tuple[PromptCandidate, float]] = []
+        # Distinct candidates evaluated so far: content_hash -> (candidate, search score)
+        evaluated: dict[str, tuple[PromptCandidate, float]] = {}
+        trial_errors: list[Exception] = []
 
-        # ── Optuna TPE study ─────────────────────────────────────────────────
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.seed),
+        )
+
         def objective(trial: optuna.Trial) -> float:
             instr_idx = trial.suggest_int("instr_idx", 0, len(instruction_variants) - 1)
             demo_idx = trial.suggest_int("demo_idx", 0, len(demo_subsets) - 1)
@@ -311,15 +336,16 @@ class MIPROv2(OptimizerStrategy):
             try:
                 budget.check()
                 summary = harness.evaluate(
-                    candidate, dev_conversations, split="dev", sample_size=self.minibatch_size
+                    candidate,
+                    minibatch,
+                    split="dev",
+                    guardrail_baseline_responses=baseline_texts,
                 )
-                budget.record_call(n_calls=self.minibatch_size)
                 score = summary.mean_score
-
                 if not summary.guardrail_passed:
                     score *= 0.5  # penalise guardrail violations
 
-                all_candidates.append((candidate, score))
+                evaluated[candidate.content_hash] = (candidate, score)
                 logger.info(
                     "Trial %d: score=%.4f (instr=%d, demo=%d)",
                     trial.number,
@@ -331,39 +357,34 @@ class MIPROv2(OptimizerStrategy):
 
             except BudgetExceededError as e:
                 trial.set_user_attr("budget_exceeded", str(e))
-                raise optuna.TrialPruned()
+                study.stop()
+                raise optuna.TrialPruned() from e
+            except Exception as exc:
+                trial_errors.append(exc)
+                raise
 
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=42),
+        study.optimize(objective, n_trials=self.n_trials, catch=(Exception,))
+
+        if not evaluated and trial_errors:
+            raise OptimizationError(
+                f"All {len(trial_errors)} search trials failed; last error: {trial_errors[-1]}"
+            ) from trial_errors[-1]
+
+        # Full-dev evaluation of the initial prompt + the top-K distinct candidates
+        logger.info("Full dev eval of the initial prompt + top-%d candidates …", self.top_k)
+        ranked = sorted(evaluated.values(), key=lambda item: item[1], reverse=True)
+        finalists = [
+            cand for cand, _ in ranked if cand.content_hash != initial_prompt.content_hash
+        ][: self.top_k]
+        results = self._final_stage(
+            initial_prompt,
+            finalists,
+            dev_conversations,
+            harness,
+            budget,
+            self.regression_cases,
         )
 
-        try:
-            study.optimize(objective, n_trials=self.n_trials, catch=(Exception,))
-        except Exception as exc:
-            logger.warning("Optuna study terminated early: %s", exc)
-
-        # Top-K full evaluation
-        logger.info("Running full dev eval for top-%d candidates …", self.top_k)
-        all_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = all_candidates[: self.top_k]
-
-        results: list[tuple[PromptCandidate, EvalSummary]] = []
-        for cand, _ in top_candidates:
-            try:
-                budget.check()
-                full_eval = harness.evaluate(cand, dev_conversations, split="dev")
-                budget.record_call(n_calls=len(dev_conversations))
-                results.append((cand, full_eval))
-            except BudgetExceededError:
-                logger.warning("Budget exhausted during top-K full eval; stopping")
-                break
-
-        if not results:
-            # Fallback: return initial prompt with baseline eval
-            results = [(initial_prompt, baseline_eval)]
-
-        results.sort(key=lambda x: x[1].mean_score, reverse=True)
         logger.info(
             "MIPROv2 complete: best score=%.4f (budget: %s)",
             results[0][1].mean_score,

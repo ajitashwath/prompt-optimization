@@ -43,6 +43,31 @@ def test_re_ingest_persists_splits(tmp_path):
     assert sum(stats.values()) == len(RAW_LOGS)
 
 
+def test_re_ingest_keeps_test_split_frozen(tmp_path):
+    manager = _manager(tmp_path)
+    manager.re_ingest()
+    store = manager.dataset_store
+    frozen = {r.conversation_id for r in store.load_split("test")}
+    assert frozen
+
+    # A fresh export arrives: the old conversations plus new ones.
+    with open(manager.raw_logs_path, "a", encoding="utf-8") as fh:
+        for i in range(6, 16):
+            row = {
+                "conversation_id": f"c{i}",
+                "messages": [{"role": "user", "content": f"another question {i}"}],
+            }
+            fh.write(json.dumps(row) + "\n")
+
+    manager.re_ingest()
+
+    assert {r.conversation_id for r in store.load_split("test")} == frozen
+    others = {
+        r.conversation_id for split in ("train", "dev") for r in store.load_split(split)
+    }
+    assert not others & frozen
+
+
 def test_re_ingest_without_logs_is_noop(tmp_path):
     manager = _manager(tmp_path)
     manager.raw_logs_path = tmp_path / "missing.jsonl"

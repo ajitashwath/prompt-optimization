@@ -145,6 +145,12 @@ class GoldStore:
             row.dimension_scores_json = json.dumps(dimension_scores or {})
             session.commit()
 
+    def get(self, item_id: str) -> GoldLabel | None:
+        """Return one item (labeled or not) by id, or None."""
+        with self._Session() as session:
+            row = session.get(GoldLabelRow, item_id)
+            return _row_to_label(row) if row else None
+
     def get_unlabeled(self, limit: int = 10) -> list[GoldLabel]:
         """Return up to `limit` items that haven't been labeled yet."""
         with self._Session() as session:

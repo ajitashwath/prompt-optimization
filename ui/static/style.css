@@ -348,6 +348,11 @@ body {
     margin-bottom: 0;
 }
 
+.message-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .message-role {
     font-size: 0.75rem;
     font-weight: 700;

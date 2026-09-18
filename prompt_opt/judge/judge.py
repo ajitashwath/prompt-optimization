@@ -4,7 +4,8 @@ LLM-as-Judge: scores candidate responses against a rubric.
 Key design decisions:
   - Pairwise: runs A→B and B→A orderings, averages to cancel position bias.
   - Structured output: JSON with per-dimension scores + rationale.
-  - Retries on parse failure (up to 3 attempts with tenacity).
+  - Retries transient API errors and unparsable/invalid judge output (up to 3
+    attempts); permanent errors (auth, bad request) and budget caps fail fast.
   - Separable from the model being optimized (use a different model family).
 """
 
@@ -16,7 +17,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from prompt_opt.config import settings
 from prompt_opt.ingestion.schema import ConversationRecord
@@ -58,6 +59,12 @@ class PairwiseJudgeResult:
     aggregate_score_a: float    # average score for response A across both orderings
     aggregate_score_b: float
     rationale: str
+    # Raw verdicts of the two orderings, both in ORIGINAL labels (A = response_a):
+    #   verdict_ab: verdict when response_a was listed first
+    #   verdict_ba: verdict when response_b was listed first, mapped back
+    # Used by the calibrator to measure position bias. None if unavailable.
+    verdict_ab: str | None = None
+    verdict_ba: str | None = None
 
 
 # ─── Prompt templates ─────────────────────────────────────────────────────────
@@ -172,54 +179,74 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"No valid JSON found in response: {text[:300]!r}")
 
 
-def _parse_pairwise_response(data: dict, rubric: Rubric) -> JudgeResult:
-    """Parse the A-perspective scores from a pairwise JSON response."""
+def _parse_dimension_scores(raw_dims: object, rubric: Rubric) -> list[DimensionScore]:
+    """
+    Validate and convert a `{dimension: {"score": n, "rationale": ...}}` object.
+
+    Raises ValueError (retryable) if a rubric dimension is missing or malformed,
+    instead of silently substituting a default score. Out-of-range scores are
+    clamped to [1, scale].
+    """
+    if not isinstance(raw_dims, dict):
+        raise ValueError(f"dimension scores must be an object, got {type(raw_dims).__name__}")
     dim_scores = []
-    raw_dims = data.get("dimension_scores", {})
     for dim in rubric.dimensions:
-        raw = raw_dims.get(dim.name, {})
-        score = float(raw.get("score", dim.scale // 2))
+        raw = raw_dims.get(dim.name)
+        if isinstance(raw, int | float) and not isinstance(raw, bool):
+            raw = {"score": raw}
+        if not isinstance(raw, dict) or "score" not in raw:
+            raise ValueError(f"judge output is missing a score for dimension {dim.name!r}")
+        try:
+            score = float(raw["score"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"non-numeric score for dimension {dim.name!r}") from exc
+        score = min(max(score, 1.0), float(dim.scale))
         dim_scores.append(
             DimensionScore(
                 dimension=dim.name,
                 score=score,
                 max_score=float(dim.scale),
-                rationale=raw.get("rationale", ""),
+                rationale=str(raw.get("rationale", "")),
             )
         )
+    return dim_scores
+
+
+def _parse_pairwise_side(data: dict, rubric: Rubric, key: str) -> JudgeResult:
+    """Parse one response's scores (`dimension_scores` = first-listed, `_b` = second-listed)."""
+    if key not in data:
+        raise ValueError(f"judge output is missing {key!r}")
+    dim_scores = _parse_dimension_scores(data[key], rubric)
     aggregate = rubric.aggregate_scores({ds.dimension: ds.score for ds in dim_scores})
     return JudgeResult(
         dimension_scores=dim_scores,
         aggregate_score=aggregate,
-        overall_verdict=data.get("preferred", "tie"),
-        rationale=data.get("rationale", ""),
+        overall_verdict=_normalise_verdict(data.get("preferred")),
+        rationale=str(data.get("rationale", "")),
         raw_response=json.dumps(data),
     )
 
 
-def _parse_pairwise_response_b(data: dict, rubric: Rubric) -> JudgeResult:
-    """Parse the B-perspective scores from a pairwise JSON response."""
-    dim_scores = []
-    raw_dims = data.get("dimension_scores_b", data.get("dimension_scores", {}))
-    for dim in rubric.dimensions:
-        raw = raw_dims.get(dim.name, {})
-        score = float(raw.get("score", dim.scale // 2))
-        dim_scores.append(
-            DimensionScore(
-                dimension=dim.name,
-                score=score,
-                max_score=float(dim.scale),
-                rationale=raw.get("rationale", ""),
-            )
-        )
-    aggregate = rubric.aggregate_scores({ds.dimension: ds.score for ds in dim_scores})
-    return JudgeResult(
-        dimension_scores=dim_scores,
-        aggregate_score=aggregate,
-        overall_verdict=data.get("preferred", "tie"),
-        rationale=data.get("rationale", ""),
-        raw_response=json.dumps(data),
-    )
+def _normalise_verdict(value: object) -> str:
+    return value if value in ("A", "B", "tie") else "tie"
+
+
+def _flip_verdict(verdict: str) -> str:
+    return {"A": "B", "B": "A"}.get(verdict, "tie")
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transient API failures and unparsable output; never permanent errors."""
+    from prompt_opt.optimizer.budget import BudgetExceededError
+
+    if isinstance(exc, BudgetExceededError):
+        return False
+    if isinstance(exc, ValueError):  # includes json.JSONDecodeError
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in (400, 401, 403, 404, 422):
+        return False  # bad key / unknown model / unsupported params: retrying cannot help
+    return True
 
 
 # ─── LLMJudge ────────────────────────────────────────────────────────────────
@@ -243,12 +270,11 @@ class LLMJudge:
 
         self.rubric = rubric or DEFAULT_RUBRIC
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def _call_llm(self, system: str, user: str) -> str:
-        """Make a single LLM call via litellm with retry on transient failures."""
-        from prompt_opt.llm import get_litellm
+        """Make a single metered LLM call via litellm (no retry)."""
+        from prompt_opt import llm
 
-        resp = get_litellm().completion(
+        resp = llm.completion(
             model=self.model,
             messages=[
                 {"role": "system", "content": system},
@@ -259,6 +285,31 @@ class LLMJudge:
         )
         return resp.choices[0].message.content or ""
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    def _call_json(self, system: str, user: str, validate=None) -> dict:
+        """
+        Call the judge and return its parsed JSON output.
+
+        The whole call + parse + validation is retried, so unparsable or
+        structurally invalid output gets a fresh attempt just like a transient
+        API error. After the last attempt the original exception is re-raised.
+        """
+        data = _extract_json(self._call_llm(system, user))
+        if not isinstance(data, dict):
+            raise ValueError(f"judge output must be a JSON object, got {type(data).__name__}")
+        if validate is not None:
+            validate(data)
+        return data
+
+    def _validate_pairwise(self, data: dict) -> None:
+        _parse_pairwise_side(data, self.rubric, "dimension_scores")
+        _parse_pairwise_side(data, self.rubric, "dimension_scores_b")
+
     def score_pairwise(
         self,
         conversation: ConversationRecord,
@@ -268,7 +319,9 @@ class LLMJudge:
         """
         Score two responses against the rubric with position-bias correction.
 
-        Runs both A→B and B→A orderings; averages per-response scores.
+        Runs both A→B and B→A orderings; averages per-response scores. The raw
+        verdict of each ordering is returned (in original labels) so callers can
+        measure the judge's position bias.
         """
         conv_text = _format_conversation(conversation)
         rubric_text = _format_rubric(self.rubric)
@@ -282,10 +335,9 @@ class LLMJudge:
             rubric_text=rubric_text,
             max_scale=max_scale,
         )
-        raw_ab = self._call_llm(_PAIRWISE_SYSTEM, user_ab)
-        data_ab = _extract_json(raw_ab)
-        result_ab_a = _parse_pairwise_response(data_ab, self.rubric)
-        result_ab_b = _parse_pairwise_response_b(data_ab, self.rubric)
+        data_ab = self._call_json(_PAIRWISE_SYSTEM, user_ab, self._validate_pairwise)
+        result_ab_a = _parse_pairwise_side(data_ab, self.rubric, "dimension_scores")
+        result_ab_b = _parse_pairwise_side(data_ab, self.rubric, "dimension_scores_b")
 
         # ── Pass 2: B listed first (swap labels) ────────────────────────────
         user_ba = _PAIRWISE_USER.format(
@@ -295,28 +347,14 @@ class LLMJudge:
             rubric_text=rubric_text,
             max_scale=max_scale,
         )
-        raw_ba = self._call_llm(_PAIRWISE_SYSTEM, user_ba)
-        data_ba = _extract_json(raw_ba)
-        # In B→A pass: "A" in JSON refers to original B; "B" refers to original A
-        result_ba_b = _parse_pairwise_response(data_ba, self.rubric)   # original B score
-        result_ba_a = _parse_pairwise_response_b(data_ba, self.rubric) # original A score
+        data_ba = self._call_json(_PAIRWISE_SYSTEM, user_ba, self._validate_pairwise)
+        # In the B→A pass, "A" in the JSON refers to the original B and vice versa
+        result_ba_b = _parse_pairwise_side(data_ba, self.rubric, "dimension_scores")    # orig B
+        result_ba_a = _parse_pairwise_side(data_ba, self.rubric, "dimension_scores_b")  # orig A
 
-        # Average A scores from both passes
+        # Average each response's scores over both orderings
         score_a = (result_ab_a.aggregate_score + result_ba_a.aggregate_score) / 2
         score_b = (result_ab_b.aggregate_score + result_ba_b.aggregate_score) / 2
-
-        # Determine consensus preference
-        votes: dict[str, int] = {"A": 0, "B": 0, "tie": 0}
-        ab_pref = data_ab.get("preferred", "tie")
-        ba_pref = data_ba.get("preferred", "tie")
-        votes[ab_pref] = votes.get(ab_pref, 0) + 1
-        # In B→A pass the labels are flipped
-        if ba_pref == "A":
-            votes["B"] += 1
-        elif ba_pref == "B":
-            votes["A"] += 1
-        else:
-            votes["tie"] += 1
 
         if score_a > score_b + 0.05:
             preferred: Literal["A", "B", "tie"] = "A"
@@ -337,6 +375,8 @@ class LLMJudge:
             aggregate_score_a=score_a,
             aggregate_score_b=score_b,
             rationale=rationale,
+            verdict_ab=_normalise_verdict(data_ab.get("preferred")),
+            verdict_ba=_flip_verdict(_normalise_verdict(data_ba.get("preferred"))),
         )
 
     def score_absolute(
@@ -355,22 +395,12 @@ class LLMJudge:
             rubric_text=rubric_text,
             max_scale=max_scale,
         )
-        raw = self._call_llm(_ABSOLUTE_SYSTEM, user)
-        data = _extract_json(raw)
-
-        dim_scores = []
-        raw_dims = data.get("dimension_scores", {})
-        for dim in self.rubric.dimensions:
-            raw_dim = raw_dims.get(dim.name, {})
-            score = float(raw_dim.get("score", dim.scale // 2))
-            dim_scores.append(
-                DimensionScore(
-                    dimension=dim.name,
-                    score=score,
-                    max_score=float(dim.scale),
-                    rationale=raw_dim.get("rationale", ""),
-                )
-            )
+        data = self._call_json(
+            _ABSOLUTE_SYSTEM,
+            user,
+            lambda d: _parse_dimension_scores(d.get("dimension_scores"), self.rubric),
+        )
+        dim_scores = _parse_dimension_scores(data.get("dimension_scores"), self.rubric)
 
         aggregate = self.rubric.aggregate_scores(
             {ds.dimension: ds.score for ds in dim_scores}
@@ -380,6 +410,6 @@ class LLMJudge:
             dimension_scores=dim_scores,
             aggregate_score=aggregate,
             overall_verdict="score",
-            rationale=data.get("rationale", ""),
-            raw_response=raw,
+            rationale=str(data.get("rationale", "")),
+            raw_response=json.dumps(data),
         )

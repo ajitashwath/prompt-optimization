@@ -190,6 +190,7 @@ def test_canary_state_resume(tmp_path):
     )
     ctrl.should_use_challenger()
     ctrl.should_use_challenger()
+    ctrl.flush()  # request counters are persisted in batches, and on flush()
 
     # Simulate a process restart: reload from the persisted state file
     resumed = CanaryController.load(state_path=str(state_file))

@@ -35,8 +35,8 @@ class ChampionEventRow(_Base):
     """
     Append-only audit log of champion transitions.
 
-    Only "promote" events define the champion succession chain used by
-    rollback(); "rollback" events are recorded for observability only.
+    rollback() replays "promote" and "rollback" events in order to derive the
+    champion succession chain (see PromptRegistry.rollback).
     """
 
     __tablename__ = "champion_events"
@@ -152,7 +152,10 @@ class PromptRegistry:
         Register a new prompt version. Returns version_id.
 
         If a version with the same content_hash already exists, returns
-        the existing version_id (idempotent).
+        the existing version_id (idempotent). The prompt content never changes,
+        but evaluation metadata supplied on a repeat call is not discarded:
+        `gate_result_dict` replaces the stored gate result (latest verdict wins)
+        and `eval_scores` fills in only if none were stored yet.
         """
         content_hash = self._compute_hash(system_prompt, few_shot_demos)
 
@@ -162,6 +165,15 @@ class PromptRegistry:
             ).first()
             if existing:
                 logger.debug("Prompt already registered: %s", existing.version_id)
+                changed = False
+                if gate_result_dict:
+                    existing.gate_result_json = json.dumps(gate_result_dict)
+                    changed = True
+                if eval_scores and json.loads(existing.eval_scores_json or "{}") == {}:
+                    existing.eval_scores_json = json.dumps(eval_scores)
+                    changed = True
+                if changed:
+                    session.commit()
                 return existing.version_id
 
             n = session.query(PromptVersionRow).count() + 1
@@ -182,6 +194,21 @@ class PromptRegistry:
             session.commit()
             logger.info("Registered prompt version %s (hash=%s)", version_id, content_hash)
             return version_id
+
+    def attach_gate_result(self, version_id: str, gate_result: dict) -> None:
+        """
+        Record the latest champion-gate verdict on a registered version.
+
+        The prompt text and demos stay immutable; only this metadata slot is
+        rewritten. `promote` callers can inspect `PromptVersion.gate_result` to
+        confirm a version passed the gate before it goes live.
+        """
+        with self._Session() as session:
+            row = session.get(PromptVersionRow, version_id)
+            if row is None:
+                raise KeyError(f"Version {version_id!r} not found in registry")
+            row.gate_result_json = json.dumps(gate_result)
+            session.commit()
 
     def promote(self, version_id: str, approver: str = "system") -> None:
         """
@@ -216,9 +243,14 @@ class PromptRegistry:
         """
         Rollback to the version promoted immediately before the current champion.
 
-        The champion succession chain is derived exclusively from the
-        "promote" events in the audit log — `deployed_at` timestamps are never
-        rewritten, so history cannot be corrupted by repeated rollbacks.
+        The champion succession chain is replayed from the audit log as a
+        stack: a "promote" pushes its version (consecutive promotions of the
+        same version collapse), and a "rollback" pops the version it rolled
+        back from. A version that was rolled back therefore never becomes a
+        rollback target again (promote A, B, roll back to A, promote C, then
+        roll back -> A, not the already-rejected B). `deployed_at` timestamps
+        are never rewritten, so history cannot be corrupted by repeated
+        rollbacks.
 
         Returns the version_id of the reverted-to champion, or None if the
         current champion has no predecessor (i.e. nothing to roll back to).
@@ -231,19 +263,28 @@ class PromptRegistry:
                 logger.warning("No champion set; nothing to roll back")
                 return None
 
-            promote_events = session.scalars(
+            events = session.scalars(
                 select(ChampionEventRow)
-                .where(ChampionEventRow.action == "promote")
+                .where(ChampionEventRow.action.in_(("promote", "rollback")))
                 .order_by(ChampionEventRow.event_id.asc())
             ).all()
 
-            # Collapse consecutive promotions of the same version into one step.
             chain: list[str] = []
-            for ev in promote_events:
-                if not chain or chain[-1] != ev.version_id:
-                    chain.append(ev.version_id)
+            for ev in events:
+                if ev.action == "promote":
+                    if not chain or chain[-1] != ev.version_id:
+                        chain.append(ev.version_id)
+                else:
+                    # The version rolled back from leaves the chain; the event's
+                    # version_id is the target that is now on top.
+                    if chain:
+                        chain.pop()
+                    while chain and chain[-1] != ev.version_id:
+                        chain.pop()
+                    if not chain:
+                        chain.append(ev.version_id)
 
-            # Find where the current champion entered the chain; its
+            # Find where the current champion sits in the chain; its
             # predecessor is the rollback target.
             try:
                 idx = len(chain) - 1 - chain[::-1].index(current.version_id)

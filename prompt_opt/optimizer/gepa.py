@@ -3,19 +3,25 @@ GEPA — Genetic/reflective Evolution with Pareto selection.
 
 Algorithm:
   1. Initialize population K from initial prompt (paraphrase + restructure variants).
-  2. Evaluate each candidate on dev minibatch.
-  3. Reflective mutation:
-       - For each candidate, collect low-scoring examples + judge rationale.
+  2. Select: evaluate each candidate on ONE fixed dev minibatch (same examples for
+     every candidate, so the Pareto comparison is fair), with guardrails checked
+     against the initial prompt's responses.
+  3. Reflective mutation (uses the TRAIN split, so dev stays a clean selection set):
+       - Evaluate the candidate on a train minibatch and collect the low-scoring
+         examples with the user query, the response and the judge's rationale.
        - Ask proposer LLM: "given these failures, how would you improve this prompt?"
        → produces a mutated candidate.
   4. Optional crossover: combine strongest sub-instructions from two Pareto-optimal candidates.
-  5. Pareto selection: maintain non-dominated front across:
+  5. Pareto selection: maintain the non-dominated front (unique candidates) across:
        (a) overall judge score
        (b) worst-category score
-       (c) guardrail pass rate (0 or 1 here; use continuous proxy)
-  6. Repeat until budget exhausted or N generations with no Pareto improvement.
+       (c) guardrail pass (0 or 1)
+  6. Repeat until budget exhausted or N generations with no change of the front.
+  7. Final evaluation (shared, see OptimizerStrategy._final_stage): the initial prompt and
+     the best front members are evaluated on the FULL dev split; the initial prompt is
+     always in the result so callers can tell whether anything beat it.
 
-Returns ranked list of (PromptCandidate, EvalSummary) from the Pareto front.
+Returns ranked list of (PromptCandidate, EvalSummary).
 """
 
 from __future__ import annotations
@@ -25,11 +31,13 @@ import logging
 import random
 from dataclasses import dataclass
 
+from prompt_opt import llm
 from prompt_opt.config import settings
-from prompt_opt.eval.harness import EvalHarness, PromptCandidate
-from prompt_opt.eval.metrics import EvalSummary
+from prompt_opt.eval.guardrails import RegressionCase
+from prompt_opt.eval.harness import EvalHarness, EvaluationError, PromptCandidate
+from prompt_opt.eval.metrics import EvalSummary, PerExampleResult
 from prompt_opt.ingestion.schema import ConversationRecord
-from prompt_opt.optimizer.base import OptimizerStrategy
+from prompt_opt.optimizer.base import OptimizerStrategy, empty_summary, response_texts
 from prompt_opt.optimizer.budget import BudgetController, BudgetExceededError
 
 logger = logging.getLogger(__name__)
@@ -88,9 +96,7 @@ def _call_proposer_text(system: str, user: str, model: str | None = None) -> str
     """Call proposer LLM; return plain text response."""
     model = model or settings.proposer_model
     try:
-        import litellm  # type: ignore[import]
-
-        resp = litellm.completion(
+        resp = llm.completion(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -99,6 +105,8 @@ def _call_proposer_text(system: str, user: str, model: str | None = None) -> str
             temperature=0.7,
         )
         return resp.choices[0].message.content or ""
+    except BudgetExceededError:
+        raise
     except Exception as exc:
         logger.warning("Proposer call failed: %s", exc)
         return ""
@@ -108,9 +116,7 @@ def _call_proposer_json_array(system: str, user: str, model: str | None = None) 
     """Call proposer LLM; parse JSON array response."""
     model = model or settings.proposer_model
     try:
-        import litellm  # type: ignore[import]
-
-        resp = litellm.completion(
+        resp = llm.completion(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -126,6 +132,8 @@ def _call_proposer_json_array(system: str, user: str, model: str | None = None) 
         for key in parsed:
             if isinstance(parsed[key], list):
                 return [str(v) for v in parsed[key]]
+    except BudgetExceededError:
+        raise
     except Exception as exc:
         logger.warning("Proposer JSON call failed: %s", exc)
     return []
@@ -143,6 +151,7 @@ class Individual:
     obj_worst_cat: float = 0.0    # worst category mean score
     obj_guardrail: float = 0.0    # 1.0 if passed, 0.0 if failed
     generation: int = 0
+    reflection: EvalSummary | None = None  # train-minibatch eval used for reflective mutation
 
 
 def _dominates(a: Individual, b: Individual) -> bool:
@@ -184,17 +193,25 @@ def _set_objectives(ind: Individual, summary: EvalSummary) -> None:
     ind.obj_guardrail = 1.0 if summary.guardrail_passed else 0.0
 
 
+def _snippet(text: str | None, limit: int) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 class GEPA(OptimizerStrategy):
     """
     Genetic-Pareto reflective evolution optimizer.
 
     Args:
-        population_size:     Initial number of candidates.
+        population_size:     Max new candidates evaluated per generation.
         max_generations:     Maximum evolution generations.
-        stagnation_limit:    Stop if Pareto front unchanged for this many generations.
-        minibatch_size:      Dev examples per generation eval.
+        stagnation_limit:    Stop if the Pareto front is unchanged for this many generations.
+        minibatch_size:      Examples per selection (dev) / reflection (train) minibatch.
         n_init_variants:     Initial population size from prompt paraphrasing.
         crossover_prob:      Probability of crossover between two Pareto-front individuals.
+        final_top_k:         Front members to evaluate on the full dev split.
+        regression_cases:    Regression suite replayed live for each finalist (optional).
+        seed:                Seed for minibatch sampling and crossover.
     """
 
     def __init__(
@@ -206,6 +223,9 @@ class GEPA(OptimizerStrategy):
         minibatch_size: int = 15,
         n_init_variants: int = 5,
         crossover_prob: float = 0.3,
+        final_top_k: int = 3,
+        regression_cases: list[RegressionCase] | None = None,
+        seed: int = 42,
     ):
         self.population_size = population_size
         self.max_generations = max_generations
@@ -213,6 +233,9 @@ class GEPA(OptimizerStrategy):
         self.minibatch_size = minibatch_size
         self.n_init_variants = n_init_variants
         self.crossover_prob = crossover_prob
+        self.final_top_k = final_top_k
+        self.regression_cases = regression_cases
+        self.seed = seed
 
     @property
     def name(self) -> str:
@@ -223,80 +246,102 @@ class GEPA(OptimizerStrategy):
         initial_prompt: PromptCandidate,
         budget: BudgetController,
     ) -> list[Individual]:
-        """Generate initial population by paraphrasing the seed prompt."""
+        """Generate initial population by paraphrasing the seed prompt (initial is index 0)."""
         budget.check()
         system = _INIT_VARIANTS_SYSTEM.format(k=self.n_init_variants)
         user = f"System prompt:\n{initial_prompt.system_prompt}"
         variants = _call_proposer_json_array(system, user)
-        budget.record_call(n_calls=1, input_tokens=len(user) // 4, output_tokens=300)
 
         population = [Individual(candidate=initial_prompt, generation=0)]
+        seen = {initial_prompt.content_hash}
         for v in variants[: self.n_init_variants]:
-            if v and v != initial_prompt.system_prompt:
-                cand = PromptCandidate(
-                    system_prompt=v,
-                    metadata={"origin": "gepa_init"},
-                )
+            if not v:
+                continue
+            cand = PromptCandidate(
+                system_prompt=v,
+                few_shot_demos=initial_prompt.few_shot_demos,
+                metadata={"origin": "gepa_init"},
+            )
+            if cand.content_hash not in seen:
+                seen.add(cand.content_hash)
                 population.append(Individual(candidate=cand, generation=0))
 
         logger.info("GEPA: initialized population of %d individuals", len(population))
         return population
 
-    def _evaluate_population(
+    def _evaluate_individual(
         self,
-        population: list[Individual],
-        dev_conversations: list[ConversationRecord],
+        ind: Individual,
+        minibatch: list[ConversationRecord],
         harness: EvalHarness,
-        budget: BudgetController,
-        generation: int,
+        baseline_texts: dict[str, str] | None,
     ) -> None:
-        """Evaluate all individuals in the population (in-place)."""
-        for ind in population:
-            if ind.eval_summary is not None:
-                continue  # already evaluated
-            try:
-                budget.check()
-                summary = harness.evaluate(
-                    ind.candidate,
-                    dev_conversations,
-                    split="dev",
-                    sample_size=self.minibatch_size,
-                )
-                budget.record_call(n_calls=self.minibatch_size)
-                _set_objectives(ind, summary)
-                logger.debug(
-                    "Gen %d — %s: overall=%.3f, worst_cat=%.3f, guardrail=%s",
-                    generation,
-                    ind.candidate.content_hash,
-                    ind.obj_overall,
-                    ind.obj_worst_cat,
-                    "pass" if ind.obj_guardrail > 0.5 else "fail",
-                )
-            except BudgetExceededError:
-                raise
+        """Score one individual on the shared dev minibatch (in-place)."""
+        summary = harness.evaluate(
+            ind.candidate,
+            minibatch,
+            split="dev",
+            guardrail_baseline_responses=baseline_texts,
+        )
+        _set_objectives(ind, summary)
+        logger.debug(
+            "%s: overall=%.3f, worst_cat=%.3f, guardrail=%s",
+            ind.candidate.content_hash,
+            ind.obj_overall,
+            ind.obj_worst_cat,
+            "pass" if ind.obj_guardrail > 0.5 else "fail",
+        )
 
     def _mutate(
         self,
         ind: Individual,
+        reflection_batch: list[ConversationRecord],
+        convs_by_id: dict[str, ConversationRecord],
+        harness: EvalHarness,
         budget: BudgetController,
     ) -> Individual | None:
-        """Reflective mutation: use judge rationale from failing examples to improve prompt."""
+        """
+        Reflective mutation: show the proposer where the prompt fails (query, response and
+        the judge's reasoning) on a TRAIN minibatch and ask for an improved prompt.
+        """
         if ind.eval_summary is None:
             return None
 
-        failing = ind.eval_summary.failing_examples(threshold=0.4)[:5]
-        if not failing:
-            # No clear failures — try a creative rewrite
-            failing = ind.eval_summary.per_example[:3]
+        summary = ind.reflection
+        if summary is None:
+            if reflection_batch:
+                budget.check()
+                try:
+                    summary = harness.evaluate(ind.candidate, reflection_batch, split="train")
+                except EvaluationError as exc:
+                    logger.warning(
+                        "Reflection eval failed for %s: %s", ind.candidate.content_hash, exc
+                    )
+                    return None
+            else:  # no train data: fall back to the selection evaluation
+                summary = ind.eval_summary
+            ind.reflection = summary
 
-        failing_text = "\n".join(
-            f"[{ex.category}] score={ex.challenger_score:.2f}"
-            for ex in failing
-        )
+        failing = summary.failing_examples(threshold=0.4)[:5]
+        if not failing:
+            # No clear failures — reflect on the weakest examples anyway
+            failing = sorted(summary.per_example, key=lambda e: e.challenger_score)[:3]
+
+        def describe(ex: PerExampleResult) -> str:
+            conv = convs_by_id.get(ex.example_id)
+            query = ""
+            if conv is not None:
+                user_turns = [m.content for m in conv.user_turns if m.content]
+                query = user_turns[-1] if user_turns else ""
+            return (
+                f"[{ex.category}] score={ex.challenger_score:.2f}\n"
+                f"  user: {_snippet(query, 300)}\n"
+                f"  response: {_snippet(ex.response_text, 300)}"
+            )
+
+        failing_text = "\n".join(describe(ex) for ex in failing) or "None"
         rationale_text = "\n".join(
-            f"- {ex.judge_rationale[:150]}"
-            for ex in failing
-            if ex.judge_rationale
+            f"- {_snippet(ex.judge_rationale, 150)}" for ex in failing if ex.judge_rationale
         ) or "No specific rationale available."
 
         budget.check()
@@ -306,7 +351,6 @@ class GEPA(OptimizerStrategy):
             judge_rationale=rationale_text,
         )
         new_prompt_text = _call_proposer_text(_MUTATE_SYSTEM, user)
-        budget.record_call(n_calls=1, input_tokens=len(user) // 4, output_tokens=400)
 
         if not new_prompt_text or new_prompt_text == ind.candidate.system_prompt:
             return None
@@ -335,7 +379,6 @@ class GEPA(OptimizerStrategy):
             prompt_b=b.candidate.system_prompt,
         )
         combined = _call_proposer_text(_CROSSOVER_SYSTEM, user)
-        budget.record_call(n_calls=1, input_tokens=len(user) // 4, output_tokens=400)
 
         if not combined:
             return None
@@ -343,15 +386,17 @@ class GEPA(OptimizerStrategy):
         return Individual(
             candidate=PromptCandidate(
                 system_prompt=combined,
+                few_shot_demos=a.candidate.few_shot_demos,
                 metadata={
                     "origin": "gepa_crossover",
                     "parent_a": a.candidate.content_hash,
                     "parent_b": b.candidate.content_hash,
                 },
-            )
+            ),
+            generation=max(a.generation, b.generation) + 1,
         )
 
-    def optimize(
+    def _optimize(
         self,
         initial_prompt: PromptCandidate,
         train_conversations: list[ConversationRecord],
@@ -359,108 +404,133 @@ class GEPA(OptimizerStrategy):
         harness: EvalHarness,
         budget: BudgetController,
     ) -> list[tuple[PromptCandidate, EvalSummary]]:
-        rng = random.Random(42)
+        rng = random.Random(self.seed)
+
+        # Fixed minibatches: dev for selection (shared by every candidate), train for
+        # reflection.
+        dev_batch = rng.sample(dev_conversations, min(self.minibatch_size, len(dev_conversations)))
+        train_batch = (
+            rng.sample(train_conversations, min(self.minibatch_size, len(train_conversations)))
+            if train_conversations
+            else []
+        )
+        convs_by_id = {c.conversation_id: c for c in dev_batch + train_batch}
 
         # Initialize
         try:
             population = self._initialize_population(initial_prompt, budget)
         except BudgetExceededError:
             logger.warning("Budget exhausted during GEPA init")
-            fallback_eval = harness.evaluate(
-                initial_prompt, dev_conversations[:5], split="dev"
-            )
-            return [(initial_prompt, fallback_eval)]
+            return [(initial_prompt, empty_summary(harness, initial_prompt.content_hash))]
 
-        all_individuals: list[Individual] = []
+        # The initial prompt is evaluated first: its responses are the guardrail baseline.
+        initial_ind = population[0]
+        try:
+            self._evaluate_individual(initial_ind, dev_batch, harness, None)
+        except BudgetExceededError:
+            return [(initial_prompt, empty_summary(harness, initial_prompt.content_hash))]
+        baseline_texts = response_texts(initial_ind.eval_summary)  # type: ignore[arg-type]
+
+        evaluated: dict[str, Individual] = {initial_prompt.content_hash: initial_ind}
+        attempted: set[str] = {initial_prompt.content_hash}
         stagnation_count = 0
-        prev_front_size = 0
+        prev_front: frozenset[str] = frozenset()
 
         for gen in range(self.max_generations):
             logger.info(
-                "GEPA Generation %d/%d (pop=%d)",
+                "GEPA Generation %d/%d (%d new candidates)",
                 gen + 1,
                 self.max_generations,
                 len(population),
             )
 
-            # Evaluate unevaluated individuals
+            # Evaluate the new individuals (each unique candidate is evaluated once)
             try:
-                self._evaluate_population(population, dev_conversations, harness, budget, gen)
+                for ind in population:
+                    h = ind.candidate.content_hash
+                    if h in attempted:
+                        continue
+                    attempted.add(h)
+                    try:
+                        self._evaluate_individual(ind, dev_batch, harness, baseline_texts)
+                    except EvaluationError as exc:
+                        logger.warning("Dropping candidate %s: %s", h, exc)
+                        continue
+                    evaluated[h] = ind
             except BudgetExceededError:
                 logger.info("Budget exhausted during evaluation; stopping")
                 break
 
-            all_individuals.extend(population)
+            # Pareto front over the unique evaluated candidates
+            front = _pareto_front(list(evaluated.values()))
+            front_hashes = frozenset(i.candidate.content_hash for i in front)
 
-            # Pareto front
-            evaluated = [i for i in all_individuals if i.eval_summary is not None]
-            front = _pareto_front(evaluated)
-
-            if len(front) == prev_front_size:
+            if front_hashes == prev_front:
                 stagnation_count += 1
                 logger.info(
-                    "GEPA: Pareto front stagnated (%d/%d)",
-                    stagnation_count,
-                    self.stagnation_limit,
+                    "GEPA: Pareto front unchanged (%d/%d)", stagnation_count, self.stagnation_limit
                 )
             else:
                 stagnation_count = 0
-                prev_front_size = len(front)
+                prev_front = front_hashes
 
             if stagnation_count >= self.stagnation_limit:
                 logger.info("GEPA: early stop (stagnation)")
                 break
+            if gen == self.max_generations - 1:
+                break  # mutants of the last generation would never be evaluated
 
-            # Generate next generation via mutation
-            new_population: list[Individual] = []
+            # Next generation: reflective mutants of front members (+ optional crossover)
+            new_individuals: list[Individual] = []
+            new_hashes: set[str] = set()
 
-            # Keep Pareto front (elitism)
-            new_population.extend(front)
+            def _add(candidate_ind: Individual | None) -> None:
+                if candidate_ind is None:
+                    return
+                h = candidate_ind.candidate.content_hash
+                if h in attempted or h in new_hashes:
+                    return
+                new_hashes.add(h)
+                new_individuals.append(candidate_ind)
 
-            # Mutate Pareto-front individuals
-            for ind in front[:self.population_size]:
-                try:
-                    mutant = self._mutate(ind, budget)
-                    if mutant:
-                        new_population.append(mutant)
-                except BudgetExceededError:
-                    break
+            try:
+                for ind in front[: self.population_size]:
+                    _add(self._mutate(ind, train_batch, convs_by_id, harness, budget))
 
-            # Crossover (with probability)
-            if len(front) >= 2 and rng.random() < self.crossover_prob:
-                a, b = rng.sample(front[:4] if len(front) >= 4 else front, 2)
-                try:
-                    child = self._crossover(a, b, budget)
-                    if child:
-                        new_population.append(child)
-                except BudgetExceededError:
-                    pass
+                if len(front) >= 2 and rng.random() < self.crossover_prob:
+                    a, b = rng.sample(front[:4] if len(front) >= 4 else front, 2)
+                    _add(self._crossover(a, b, budget))
+            except BudgetExceededError:
+                logger.info("Budget exhausted during mutation; stopping")
+                break
 
-            population = new_population[: self.population_size * 2]
+            population = new_individuals[: self.population_size]
+            if not population:
+                logger.info("GEPA: no new candidates produced; stopping")
+                break
 
-        # Final Pareto front from all evaluated individuals
-        evaluated = [i for i in all_individuals if i.eval_summary is not None]
-        final_front = _pareto_front(evaluated)
+        # Finalists: best unique front members (guardrail-passing first)
+        front = _pareto_front(list(evaluated.values()))
+        front.sort(key=lambda i: (i.obj_guardrail, i.obj_overall), reverse=True)
+        finalists = [
+            i.candidate
+            for i in front
+            if i.candidate.content_hash != initial_prompt.content_hash
+        ][: self.final_top_k]
 
-        # Sort by overall score for output
-        final_front.sort(key=lambda x: x.obj_overall, reverse=True)
-
-        results = [
-            (ind.candidate, ind.eval_summary)
-            for ind in final_front
-            if ind.eval_summary is not None
-        ]
-
-        if not results:
-            fallback_eval = harness.evaluate(
-                initial_prompt, dev_conversations[:5], split="dev"
-            )
-            results = [(initial_prompt, fallback_eval)]
+        results = self._final_stage(
+            initial_prompt,
+            finalists,
+            dev_conversations,
+            harness,
+            budget,
+            self.regression_cases,
+        )
 
         logger.info(
-            "GEPA complete: %d on Pareto front, best overall=%.4f (budget: %s)",
-            len(results),
-            results[0][1].mean_score if results else 0.0,
+            "GEPA complete: %d evaluated candidates, best full-dev score=%.4f (budget: %s)",
+            len(evaluated),
+            results[0][1].mean_score,
             budget.summary(),
         )
         return results

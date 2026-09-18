@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 from prompt_opt.eval.harness import EvalHarness, PromptCandidate
 from prompt_opt.eval.metrics import PerExampleResult, compute_eval_summary
-from prompt_opt.gate.champion_gate import ChampionGate
+from prompt_opt.gate.champion_gate import ChampionGate, GateCriteria
 from prompt_opt.ingestion.schema import ConversationRecord, Message, MessageRole
 
 N = 10
@@ -72,7 +72,10 @@ def test_gate_builds_paired_comparison_without_precomputed_responses():
 
     harness.evaluate.side_effect = evaluate_side_effect
 
-    gate = ChampionGate(harness)
+    # 10 examples and no regression suite: fine for this wiring test, but the defaults
+    # (>= 30 examples, suite must run) are relaxed explicitly rather than passed vacuously.
+    criteria = GateCriteria(min_test_examples=5, require_regression_suite=False)
+    gate = ChampionGate(harness, criteria=criteria)
     result = gate.evaluate(challenger, champion, [_conv(i) for i in range(N)])
 
     # Challenger won every paired comparison

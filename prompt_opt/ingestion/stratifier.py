@@ -6,7 +6,8 @@ then performs stratified sampling with oversampling for rare/important buckets.
 
 Rules:
   - Default split: 60% train / 20% dev / 20% test
-  - Test split is returned as-is from the frozen version if one already exists
+  - This function always produces a fresh split; keeping an existing test split
+    frozen is enforced at persistence time by `DatasetStore.save`
   - Rare buckets (< min_bucket_size) are merged into an "other" stratum
   - Safety / hard difficulty buckets are oversampled by oversample_factor
 """
@@ -85,7 +86,13 @@ def stratify(
     Returns:
         StratifyResult with split-assigned ConversationRecord instances.
     """
-    assert abs(train_ratio + dev_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1"
+    if min(train_ratio, dev_ratio, test_ratio) < 0 or abs(
+        train_ratio + dev_ratio + test_ratio - 1.0
+    ) > 1e-6:
+        raise ValueError(
+            f"Split ratios must be non-negative and sum to 1 "
+            f"(got train={train_ratio}, dev={dev_ratio}, test={test_ratio})"
+        )
 
     rng = random.Random(seed)
 

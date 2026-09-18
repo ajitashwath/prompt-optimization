@@ -17,8 +17,12 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from prompt_opt.registry.prompt_registry import PromptRegistry
+
+if TYPE_CHECKING:
+    from prompt_opt.deployment.canary import CanaryController
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,12 @@ class RollbackEvent:
     previous_champion: str | None = None
     rolled_back_to: str | None = None
     metric_values: dict = field(default_factory=dict)
+    # "registry":    the champion pointer was reverted to an earlier version.
+    # "canary":      an active canary was rolled back; the champion is unchanged.
+    # "suppressed":  the breach persists but the registry was rolled back moments ago and
+    #                not re-promoted since; no further automatic rollback (a human decides).
+    # "no_previous": a rollback was needed but there is no earlier version to return to.
+    scope: str = "registry"
 
 
 AlertFn = Callable[[RollbackEvent], None]
@@ -47,7 +57,8 @@ AlertFn = Callable[[RollbackEvent], None]
 def _default_alert(event: RollbackEvent) -> None:
     """Default alerter: log to stderr. Replace with webhook/email in production."""
     logger.critical(
-        "ROLLBACK TRIGGERED: %s | rolled_back_to=%s | at=%s",
+        "ROLLBACK TRIGGERED (%s): %s | rolled_back_to=%s | at=%s",
+        event.scope,
         event.reason,
         event.rolled_back_to,
         event.triggered_at,
@@ -57,6 +68,17 @@ def _default_alert(event: RollbackEvent) -> None:
 class RollbackMonitor:
     """
     Evaluates live metrics against thresholds and triggers rollback if needed.
+
+    If an *active* `canary` is supplied, a breach rolls back the canary and
+    leaves the registry champion alone: the stable champion is not the
+    suspect while only a slice of traffic is on the challenger. Otherwise the
+    registry champion is reverted to the previously promoted version.
+
+    Automatic rollbacks do not cascade: metrics lag a rollback, so a breach that persists
+    right after one (with no promotion since) would otherwise walk the champion back
+    through history one version per check. Within `cooldown_seconds` of a registry
+    rollback that was not followed by a promotion, further breaches raise a
+    `scope="suppressed"` event and alert instead of rolling back again.
 
     Usage::
 
@@ -77,11 +99,26 @@ class RollbackMonitor:
         registry: PromptRegistry,
         config: RollbackTriggerConfig | None = None,
         alert_fn: AlertFn | None = None,
+        canary: CanaryController | None = None,
+        cooldown_seconds: float = 3600.0,
     ):
         self.registry = registry
+        self.cooldown_seconds = cooldown_seconds
         self.config = config or RollbackTriggerConfig()
         self.alert_fn = alert_fn or _default_alert
+        self.canary = canary
         self._rollback_events: list[RollbackEvent] = []
+
+    def _recent_unpromoted_rollback(self) -> tuple[dict, float] | None:
+        """(event, age in s) if the newest champion event is a rollback within the cooldown."""
+        if self.cooldown_seconds <= 0:
+            return None
+        history = self.registry.champion_history(limit=1)  # newest first
+        if not history or history[0]["action"] != "rollback":
+            return None
+        rolled_back_at = datetime.fromisoformat(history[0]["created_at"])
+        age = (datetime.utcnow() - rolled_back_at).total_seconds()
+        return (history[0], age) if age < self.cooldown_seconds else None
 
     def check(
         self,
@@ -152,14 +189,45 @@ class RollbackMonitor:
 
         reason = "Rollback triggered: " + "; ".join(triggers)
         current_champ = self.registry.get_champion()
-        previous_id = self.registry.rollback()
 
-        event = RollbackEvent(
-            reason=reason,
-            previous_champion=current_champ.version_id if current_champ else None,
-            rolled_back_to=previous_id,
-            metric_values=metric_values,
-        )
+        if self.canary is not None and self.canary.state.status == "active":
+            self.canary.rollback(reason)
+            challenger = self.registry.get_by_content_hash(self.canary.state.challenger_hash)
+            event = RollbackEvent(
+                reason=reason,
+                previous_champion=(
+                    challenger.version_id if challenger else self.canary.state.challenger_hash
+                ),
+                rolled_back_to=current_champ.version_id if current_champ else None,
+                metric_values=metric_values,
+                scope="canary",
+            )
+        elif (recent := self._recent_unpromoted_rollback()) is not None:
+            last, age = recent
+            event = RollbackEvent(
+                reason=(
+                    f"{reason} -- automatic rollback SUPPRESSED: the registry was rolled back to "
+                    f"{last['version_id']} {age:.0f}s ago and nothing has been promoted since; "
+                    f"the breach persists, investigate manually"
+                ),
+                previous_champion=current_champ.version_id if current_champ else None,
+                rolled_back_to=None,
+                metric_values=metric_values,
+                scope="suppressed",
+            )
+        else:
+            previous_id = self.registry.rollback()
+            event = RollbackEvent(
+                reason=(
+                    reason
+                    if previous_id is not None
+                    else f"{reason} -- no previous version to roll back to; investigate manually"
+                ),
+                previous_champion=current_champ.version_id if current_champ else None,
+                rolled_back_to=previous_id,
+                metric_values=metric_values,
+                scope="registry" if previous_id is not None else "no_previous",
+            )
         self._rollback_events.append(event)
         self.alert_fn(event)
         return event

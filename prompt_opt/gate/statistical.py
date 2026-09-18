@@ -2,18 +2,25 @@
 Statistical significance testing for the champion/challenger gate.
 
 Two tests are run (belt + suspenders):
-  1. Paired bootstrap (10 000 resamples) — non-parametric, robust to non-normality.
-  2. Wilcoxon signed-rank test — parametric-ish, handles ties correctly.
+  1. Paired bootstrap (10 000 resamples) — non-parametric CI on the win rate.
+  2. Wilcoxon signed-rank test — one-sided test on the per-example score differences.
 
-Both are computed on per-example win/loss/tie vectors from the eval harness.
+Both are computed on paired per-example results from the eval harness.
+
+Win rate: each example is a win (1), tie (0.5) or loss (0) for the challenger, so
+
+    win_rate = (wins + 0.5 * ties) / n.
+
+Counting ties as half keeps the null hypothesis honest ("all ties" is exactly 0.5,
+no difference) and stops a mostly-tied but clearly favourable comparison
+(30 wins / 10 losses / 60 ties) from looking like a 30% win rate. `decisive_win_rate`
+(wins / (wins + losses)) is reported for information.
 
 Returns:
-  - win_rate: fraction of examples where challenger wins
+  - win_rate: tie-half win rate
   - confidence_interval: (lower, upper) at requested CI level
-  - p_value: from Wilcoxon test
-  - ci_excludes_null: True if CI excludes 0.50 (null hypothesis win_rate)
-
-Null hypothesis: win_rate == 0.50 (coin flip — no difference).
+  - wilcoxon_pvalue: one-sided (challenger > champion)
+  - ci_excludes_null: True if the CI lower bound is above 0.50 (null: no difference)
 """
 
 from __future__ import annotations
@@ -26,6 +33,8 @@ from scipy import stats
 
 logger = logging.getLogger(__name__)
 
+_MIN_WILCOXON_DIFFS = 5
+
 
 @dataclass
 class StatTestResult:
@@ -36,22 +45,27 @@ class StatTestResult:
     n_losses: int
     n_ties: int
 
-    win_rate: float      # n_wins / (n_wins + n_losses + n_ties)
-    loss_rate: float
-    tie_rate: float
+    win_rate: float      # (n_wins + 0.5 * n_ties) / n_examples
+    loss_rate: float     # n_losses / n_examples
+    tie_rate: float      # n_ties / n_examples
 
     # Paired bootstrap CI on win_rate
     ci_lower: float
     ci_upper: float
     ci_level: float      # e.g. 0.95
 
-    # Wilcoxon signed-rank
+    # Wilcoxon signed-rank (one-sided: challenger > champion)
     wilcoxon_statistic: float
     wilcoxon_pvalue: float
 
     # Summary flags
-    ci_excludes_null: bool   # CI strictly excludes 0.50
+    ci_excludes_null: bool   # CI lower bound > 0.50
     statistically_significant: bool   # pvalue < alpha
+
+    # wins / (wins + losses); None if there was no decisive comparison
+    decisive_win_rate: float | None = None
+    # Examples with a score difference large enough to enter the Wilcoxon test
+    n_nonzero_diffs: int = 0
 
     @property
     def alpha(self) -> float:
@@ -60,7 +74,13 @@ class StatTestResult:
     def summary(self) -> dict:
         return {
             "n_examples": self.n_examples,
+            "n_wins": self.n_wins,
+            "n_losses": self.n_losses,
+            "n_ties": self.n_ties,
             "win_rate": round(self.win_rate, 4),
+            "decisive_win_rate": (
+                round(self.decisive_win_rate, 4) if self.decisive_win_rate is not None else None
+            ),
             "loss_rate": round(self.loss_rate, 4),
             "tie_rate": round(self.tie_rate, 4),
             "ci_lower": round(self.ci_lower, 4),
@@ -68,6 +88,7 @@ class StatTestResult:
             "ci_level": self.ci_level,
             "ci_excludes_null": self.ci_excludes_null,
             "wilcoxon_pvalue": round(self.wilcoxon_pvalue, 6),
+            "n_nonzero_diffs": self.n_nonzero_diffs,
             "statistically_significant": self.statistically_significant,
         }
 
@@ -80,7 +101,11 @@ def paired_bootstrap_ci(
     seed: int = 42,
 ) -> tuple[float, float, float]:
     """
-    Compute a bootstrap confidence interval on win_rate.
+    Compute a bootstrap confidence interval on the (tie-half) win rate.
+
+    Resampling examples with replacement gives category counts that follow a
+    multinomial distribution over (win, tie, loss), so the bootstrap distribution
+    is drawn directly from it — exact, and vectorised.
 
     Args:
         outcomes:    Per-example outcomes ("win", "loss", "tie").
@@ -89,22 +114,22 @@ def paired_bootstrap_ci(
         seed:        Random seed for reproducibility.
 
     Returns:
-        (win_rate, ci_lower, ci_upper)
+        (win_rate, ci_lower, ci_upper). With no outcomes there is no information:
+        (0.0, 0.0, 1.0).
     """
-    rng = np.random.default_rng(seed)
     n = len(outcomes)
+    if n == 0:
+        return 0.0, 0.0, 1.0
 
-    # Encode: win=1, tie=0, loss=-1
-    encoded = np.array([1 if o == "win" else (-1 if o == "loss" else 0) for o in outcomes])
+    n_wins = sum(1 for o in outcomes if o == "win")
+    n_ties = sum(1 for o in outcomes if o == "tie")
+    n_losses = n - n_wins - n_ties
+    win_rate = (n_wins + 0.5 * n_ties) / n
 
-    # Observed win rate
-    win_rate = float(np.sum(encoded == 1)) / n
-
-    # Bootstrap distribution of win rates
-    boot_win_rates = np.empty(n_resamples)
-    for i in range(n_resamples):
-        sample = rng.choice(encoded, size=n, replace=True)
-        boot_win_rates[i] = float(np.sum(sample == 1)) / n
+    rng = np.random.default_rng(seed)
+    probs = np.array([n_wins, n_ties, n_losses], dtype=float) / n
+    counts = rng.multinomial(n, probs / probs.sum(), size=n_resamples)
+    boot_win_rates = (counts[:, 0] + 0.5 * counts[:, 1]) / n
 
     alpha = 1 - ci_level
     ci_lower = float(np.percentile(boot_win_rates, 100 * alpha / 2))
@@ -128,18 +153,19 @@ def wilcoxon_test(
         alternative:       "greater" (challenger > champion), "two-sided", "less".
 
     Returns:
-        (statistic, pvalue)
+        (statistic, pvalue). (0.0, 1.0) — "no evidence" — if fewer than 5 examples
+        have a non-zero difference.
     """
     if len(challenger_scores) != len(champion_scores):
         raise ValueError("challenger and champion score lists must be same length")
-    if len(challenger_scores) < 5:
+    if len(challenger_scores) < _MIN_WILCOXON_DIFFS:
         logger.warning("Too few samples for Wilcoxon test (n=%d < 5)", len(challenger_scores))
         return 0.0, 1.0
 
-    diffs = [c - ch for c, ch in zip(challenger_scores, champion_scores)]
+    diffs = [c - ch for c, ch in zip(challenger_scores, champion_scores, strict=True)]
     # scipy's wilcoxon requires non-zero differences (ties are dropped)
     non_zero_diffs = [d for d in diffs if abs(d) > 1e-9]
-    if len(non_zero_diffs) < 5:
+    if len(non_zero_diffs) < _MIN_WILCOXON_DIFFS:
         logger.warning("Too many ties for Wilcoxon test (%d non-zero diffs)", len(non_zero_diffs))
         return 0.0, 1.0
 
@@ -178,9 +204,12 @@ def run_statistical_tests(
     )
 
     wil_stat, wil_p = wilcoxon_test(challenger_scores, champion_scores)
+    n_nonzero = sum(
+        1 for c, ch in zip(challenger_scores, champion_scores, strict=True) if abs(c - ch) > 1e-9
+    )
 
     alpha = 1 - ci_level
-    ci_excludes_null = ci_lower > 0.50
+    ci_excludes_null = n > 0 and ci_lower > 0.50
     statistically_significant = wil_p < alpha
 
     return StatTestResult(
@@ -198,4 +227,6 @@ def run_statistical_tests(
         wilcoxon_pvalue=wil_p,
         ci_excludes_null=ci_excludes_null,
         statistically_significant=statistically_significant,
+        decisive_win_rate=n_wins / (n_wins + n_losses) if (n_wins + n_losses) else None,
+        n_nonzero_diffs=n_nonzero,
     )

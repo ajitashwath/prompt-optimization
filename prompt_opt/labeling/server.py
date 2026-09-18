@@ -22,6 +22,7 @@ from prompt_opt.judge.calibrator import JudgeCalibrator
 from prompt_opt.judge.judge import LLMJudge
 from prompt_opt.labeling.gold_store import GoldStore
 from prompt_opt.labeling.rubric import DEFAULT_RUBRIC
+from prompt_opt.storage.dataset_store import DatasetStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 gold_store = GoldStore()
 judge = LLMJudge()
 calibrator = JudgeCalibrator(judge, gold_store)
+
+
+def _conversations_for(conversation_ids: set[str]) -> dict:
+    """Conversation context (train/dev splits) for the given gold-item conversation ids."""
+    return DatasetStore().find_conversations(conversation_ids)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -78,14 +84,12 @@ async def view_queue(request: Request):
 @app.get("/annotate/{item_id}", response_class=HTMLResponse)
 async def annotate_item_view(request: Request, item_id: str):
     """Side-by-side pairwise comparison view for annotation."""
-    # Find item in the store
-    labeled_items = gold_store.get_labeled()
-    unlabeled_items = gold_store.get_unlabeled(limit=100)
-    all_items = labeled_items + unlabeled_items
-    item = next((i for i in all_items if i.id == item_id), None)
-
+    item = gold_store.get(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
+
+    # Annotators must judge the responses in the context the judge will see
+    conversation = _conversations_for({item.conversation_id}).get(item.conversation_id)
 
     return templates.TemplateResponse(
         "annotate.html",
@@ -94,6 +98,7 @@ async def annotate_item_view(request: Request, item_id: str):
             "title": f"Annotating Item {item_id[:8]}",
             "active_tab": "queue",
             "item": item,
+            "conversation": conversation,
             "rubric": DEFAULT_RUBRIC,
         },
     )
@@ -121,9 +126,18 @@ async def submit_annotation(
 
 
 @app.get("/calibration", response_class=HTMLResponse)
-async def view_calibration(request: Request):
-    """Run calibration dynamically and view the bias diagnostics report."""
-    report = calibrator.calibrate(rubric_version=DEFAULT_RUBRIC.version)
+def view_calibration(request: Request):
+    """
+    Run calibration dynamically and view the bias diagnostics report.
+
+    A plain `def` so FastAPI runs it in a worker thread: it makes blocking LLM calls
+    (two per labeled item) and must not stall the event loop.
+    """
+    labeled = gold_store.get_labeled(rubric_version=DEFAULT_RUBRIC.version)
+    conversations = _conversations_for({item.conversation_id for item in labeled})
+    report = calibrator.calibrate(
+        rubric_version=DEFAULT_RUBRIC.version, conversations=conversations
+    )
     return templates.TemplateResponse(
         "calibration.html",
         {

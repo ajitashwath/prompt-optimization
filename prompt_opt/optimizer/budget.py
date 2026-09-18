@@ -84,6 +84,35 @@ class BudgetController:
             self.max_wall_seconds,
         )
 
+    def record_response(self, model: str, response: object) -> None:
+        """
+        Record one completed LLM call from its response.
+
+        Cost comes from litellm's pricing table when it knows the model, else
+        from the response's token usage and the rough `_MODEL_COSTS` table.
+        Tolerates responses without usage information (counted as one call).
+        """
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0)
+        output_tokens = getattr(usage, "completion_tokens", 0)
+        if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
+            input_tokens = 0
+        if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+            output_tokens = 0
+
+        cost: object = None
+        try:
+            from prompt_opt.llm import get_litellm
+
+            cost = get_litellm().completion_cost(completion_response=response)
+        except Exception:  # noqa: BLE001 - unknown model / malformed response
+            cost = None
+        if isinstance(cost, bool) or not isinstance(cost, int | float) or cost < 0:
+            cost = estimate_cost_usd(model, input_tokens, output_tokens)
+
+        self._llm_calls += 1
+        self._usd_spend += float(cost)
+
     def check(self) -> None:
         """Raise BudgetExceededError if any cap is hit."""
         if self._llm_calls >= self.max_llm_calls:

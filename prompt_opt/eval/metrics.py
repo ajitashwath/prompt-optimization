@@ -68,6 +68,11 @@ class EvalSummary:
     guardrail_passed: bool = True
     guardrail_details: dict = field(default_factory=dict)
 
+    # Examples whose model or judge call failed. They are excluded from every
+    # aggregate above (never scored, never cached), so n_examples counts only
+    # successfully scored examples.
+    failed_example_ids: list[str] = field(default_factory=list)
+
     def worst_categories(self, n: int = 3) -> list[CategoryBreakdown]:
         """Return the n categories with lowest win-rate or mean score."""
         return sorted(
@@ -85,6 +90,7 @@ class EvalSummary:
             "split": self.split,
             "judge_version": self.judge_version,
             "n_examples": self.n_examples,
+            "n_failed": len(self.failed_example_ids),
             "mean_score": self.mean_score,
             "median_score": self.median_score,
             "std_score": self.std_score,

@@ -11,14 +11,26 @@
     <div class="context-panel">
         <h2 class="panel-title">Conversation Context</h2>
         <div class="conversation-view">
-            <div class="message message-user">
-                <span class="message-role">USER</span>
-                <p>Conversation ID: <code>{{ item.conversation_id }}</code></p>
-            </div>
-            <!-- Stub or full dialog if available -->
+            {% if conversation %}
+                {% for m in conversation.without_system_prompt() %}
+                <div class="message message-{{ m.role.value }}">
+                    <span class="message-role">{{ m.role.value|upper }}</span>
+                    <p class="message-text">{{ m.content or "" }}</p>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="message message-system">
+                    <span class="message-role">NO CONTEXT</span>
+                    <p class="message-text">The conversation <code>{{ item.conversation_id }}</code>
+                    was not found in the train/dev splits, so it cannot be shown. Run
+                    <code>prompt-opt ingest</code> first. Items without context are skipped when
+                    calibrating the judge.</p>
+                </div>
+            {% endif %}
             <div class="message message-system">
-                <span class="message-role">SYS</span>
-                <p>Rubric: {{ item.rubric_version }}</p>
+                <span class="message-role">META</span>
+                <p>Conversation ID: <code>{{ item.conversation_id }}</code> &middot;
+                Rubric: {{ item.rubric_version }}</p>
             </div>
         </div>
 

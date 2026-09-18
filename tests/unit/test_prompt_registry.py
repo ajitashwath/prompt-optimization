@@ -1,5 +1,7 @@
 """Tests for PromptRegistry content-hash lookup and rollback succession semantics."""
 
+import pytest
+
 from prompt_opt.registry.prompt_registry import PromptRegistry
 
 
@@ -54,6 +56,74 @@ def test_rollback_after_repromote():
     reg.promote(v3)
     assert reg.get_champion().version_id == v3
     assert reg.rollback() == v2
+
+
+def test_rollback_never_returns_to_a_rolled_back_version():
+    reg = _registry()
+    a = reg.register(system_prompt="A")
+    b = reg.register(system_prompt="B")
+    c = reg.register(system_prompt="C")
+
+    reg.promote(a)
+    reg.promote(b)
+    assert reg.rollback() == a  # B rejected
+
+    reg.promote(c)
+    # B was already rolled back from; the predecessor of C is A, not B
+    assert reg.rollback() == a
+    assert reg.get_champion().version_id == a
+    assert reg.rollback() is None
+
+
+def test_rollback_chain_after_repeated_rollbacks_and_promotions():
+    reg = _registry()
+    v1, v2, v3, v4 = (reg.register(system_prompt=f"V{i}") for i in range(1, 5))
+
+    reg.promote(v1)
+    reg.promote(v2)
+    reg.promote(v3)
+    assert reg.rollback() == v2  # v3 rejected
+    assert reg.rollback() == v1  # v2 rejected too
+    reg.promote(v4)
+    assert reg.rollback() == v1  # neither v2 nor v3 come back
+
+
+def test_register_existing_hash_keeps_gate_result():
+    reg = _registry()
+    vid = reg.register(system_prompt="Z", eval_scores={"mean_score": 0.9})
+
+    again = reg.register(
+        system_prompt="Z",
+        eval_scores={"mean_score": 0.1},
+        gate_result_dict={"decision": "PASS"},
+    )
+
+    assert again == vid
+    version = reg.get(vid)
+    assert version.gate_result == {"decision": "PASS"}
+    # First-stored eval scores are not overwritten
+    assert version.eval_scores == {"mean_score": 0.9}
+
+
+def test_register_existing_hash_fills_missing_eval_scores():
+    reg = _registry()
+    vid = reg.register(system_prompt="Z")
+    reg.register(system_prompt="Z", eval_scores={"mean_score": 0.7})
+    assert reg.get(vid).eval_scores == {"mean_score": 0.7}
+
+
+def test_attach_gate_result():
+    reg = _registry()
+    vid = reg.register(system_prompt="P")
+    assert reg.get(vid).gate_result == {}
+
+    reg.attach_gate_result(vid, {"decision": "PENDING_HUMAN"})
+    assert reg.get(vid).gate_result == {"decision": "PENDING_HUMAN"}
+    reg.attach_gate_result(vid, {"decision": "PASS"})
+    assert reg.get(vid).gate_result["decision"] == "PASS"
+
+    with pytest.raises(KeyError):
+        reg.attach_gate_result("prompt_v999", {})
 
 
 def test_champion_history_audit_log():

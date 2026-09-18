@@ -4,6 +4,9 @@ Shadow mode deployment.
 Runs the challenger prompt alongside the champion on live traffic,
 logs responses without serving them to users, and scores asynchronously.
 
+Both prompts are run exactly as the eval harness runs them (system prompt AND
+few-shot demos), so what is shadowed is what was evaluated.
+
 Usage::
 
     shadow = ShadowRunner(challenger_prompt, champion_prompt, log_path="./data/shadow_logs")
@@ -15,13 +18,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from prompt_opt import llm
 from prompt_opt.config import settings
-from prompt_opt.eval.harness import PromptCandidate
+from prompt_opt.eval.harness import PromptCandidate, build_messages
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +34,24 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ShadowResult:
     request_id: str
-    champion_response: str       # served to the user
-    challenger_response: str     # logged only, NOT served
+    champion_response: str       # served to the user ("" if the champion call failed)
+    challenger_response: str     # logged only, NOT served ("" if the challenger call failed)
     timestamp: str
     latency_champion_ms: float
     latency_challenger_ms: float
-    error: str | None = None
+    error: str | None = None     # combined description of any failure, None if both succeeded
+    champion_error: str | None = None
+    challenger_error: str | None = None
 
 
 class ShadowRunner:
     """
-    Run champion and challenger in parallel (for logging/scoring), serve only champion.
+    Run champion and challenger (for logging/scoring), serve only champion.
 
     In production this would run as an async sidecar or thread pool; here we
     run sequentially with timing measurements to keep dependencies minimal.
+    A failed call never raises: it yields an empty response and a recorded error, so
+    a flaky challenger cannot affect serving and a failure is never mistaken for an answer.
     """
 
     def __init__(
@@ -59,25 +68,22 @@ class ShadowRunner:
         self._log_path.mkdir(parents=True, exist_ok=True)
         self._log_file = self._log_path / "shadow_log.jsonl"
 
-    def _call_model(self, system_prompt: str, messages: list[dict]) -> tuple[str, float]:
-        """Call the model; returns (response_text, latency_ms)."""
-        import time
+    def _call_model(
+        self, candidate: PromptCandidate, messages: list[dict]
+    ) -> tuple[str, float, str | None]:
+        """Call the model with the candidate's system prompt and demos.
 
-        from prompt_opt.llm import get_litellm
-
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        Returns (response_text, latency_ms, error). On failure the text is "".
+        """
+        full_messages = build_messages(candidate.system_prompt, candidate.few_shot_demos, messages)
         t0 = time.perf_counter()
         try:
-            resp = get_litellm().completion(
-                model=self.model,
-                messages=full_messages,
-                temperature=0.0,
-            )
+            resp = llm.completion(model=self.model, messages=full_messages, temperature=0.0)
             latency_ms = (time.perf_counter() - t0) * 1000
-            return resp.choices[0].message.content or "", latency_ms
-        except Exception as exc:
+            return resp.choices[0].message.content or "", latency_ms, None
+        except Exception as exc:  # noqa: BLE001 - shadowing must never break the caller
             latency_ms = (time.perf_counter() - t0) * 1000
-            return f"[ERROR: {exc}]", latency_ms
+            return "", latency_ms, f"{type(exc).__name__}: {exc}"
 
     def run_request(self, messages: list[dict]) -> ShadowResult:
         """
@@ -91,8 +97,14 @@ class ShadowRunner:
         """
         request_id = str(uuid.uuid4())[:8]
 
-        champ_text, champ_latency = self._call_model(self.champion.system_prompt, messages)
-        chal_text, chal_latency = self._call_model(self.challenger.system_prompt, messages)
+        champ_text, champ_latency, champ_error = self._call_model(self.champion, messages)
+        chal_text, chal_latency, chal_error = self._call_model(self.challenger, messages)
+
+        errors = []
+        if champ_error:
+            errors.append(f"champion: {champ_error}")
+        if chal_error:
+            errors.append(f"challenger: {chal_error}")
 
         result = ShadowResult(
             request_id=request_id,
@@ -101,6 +113,9 @@ class ShadowRunner:
             timestamp=datetime.utcnow().isoformat(),
             latency_champion_ms=champ_latency,
             latency_challenger_ms=chal_latency,
+            error="; ".join(errors) or None,
+            champion_error=champ_error,
+            challenger_error=chal_error,
         )
 
         self._log(result, messages)
@@ -117,6 +132,8 @@ class ShadowRunner:
             "challenger_response": result.challenger_response,
             "latency_champion_ms": result.latency_champion_ms,
             "latency_challenger_ms": result.latency_challenger_ms,
+            "champion_error": result.champion_error,
+            "challenger_error": result.challenger_error,
         }
         with open(self._log_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
